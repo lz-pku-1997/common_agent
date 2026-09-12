@@ -1,0 +1,21 @@
+# 本地密钥：只能留在自己的电脑上，不能提交到 Git。
+.env
+
+# Python 虚拟环境和运行缓存。
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# SQLite 会保存真实对话，不应提交到代码仓库。
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+
+# Agent 运行后在工作区中新建的文件默认不提交。
+# welcome.md 是随项目交付的示例文件，所以单独保留。
+workspace/*
+!workspace/welcome.md
+!workspace/knowledge/
+workspace/knowledge/*
+!workspace/knowledge/common_agent_facts.md
