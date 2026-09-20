@@ -63,8 +63,7 @@ class AgentState(TypedDict):
 def build_agent_graph(model, tools: list[BaseTool], system_prompt: str, checkpointer=None):
     """把上面的图画出来并编译。
 
-    返回的同样是 LangGraph 的 CompiledStateGraph，跟 `create_agent` 的产物
-    有一样的 `ainvoke` / `aget_state`，所以上层的 cli.py 不需要改。
+    返回的是 LangGraph 的 CompiledStateGraph，上层用 `ainvoke` / `aget_state` 驱动。
 
     参数里的 checkpointer 由外层传入：SQLite 连接必须在使用期间保持打开。
     """

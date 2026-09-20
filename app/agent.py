@@ -1,18 +1,12 @@
 """创建 common_agent 的模型与 Agent 图。
 
-这里保留两套引擎，用 .env 里的 COMMON_AGENT_ENGINE 切换：
-
-- `manual`（默认）：`app/manual_loop.py` 里自己画的图。每一步都在明面上，
-  被问「循环什么时候停」可以指着某一行代码回答。
-- `framework`：`create_agent` 的高层入口。循环由框架生成，代码更短但更黑盒。
-
-保留两套不是为了炫技，而是为了能回答「两套你都写过，差别在哪」。
+只有一套引擎：`app/manual_loop.py` 里自己画的图。
+每一步都在明面上，被问「循环什么时候停」可以指着某一行代码回答。
 """
 
-from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
-from app.config import load_agent_engine, load_model_settings
+from app.config import load_model_settings
 from app.manual_loop import build_agent_graph
 from app.mcp_bridge import load_mcp_tools
 from app.rag_tools import RAG_TOOLS
@@ -57,9 +51,6 @@ def create_chat_model() -> ChatOpenAI:
 async def build_common_agent(checkpointer):
     """组装“模型 + 工具循环 + SQLite 记忆”并返回可运行的 Agent。
 
-    默认走 `manual_loop.py` 里自己画的图；把 COMMON_AGENT_ENGINE 设成
-    `framework` 就切回 create_agent 的高层入口，方便两套对照着看。
-
     checkpointer 由外层传入，因为 SQLite 连接必须在使用期间保持打开。
     """
 
@@ -68,30 +59,9 @@ async def build_common_agent(checkpointer):
     all_tools = [*WORKSPACE_TOOLS, *RAG_TOOLS, *mcp_tools]
     model = create_chat_model()
 
-    if load_agent_engine() == "framework":
-        return build_framework_agent(model, all_tools, checkpointer)
     return build_agent_graph(
         model=model,
         tools=all_tools,
         system_prompt=SYSTEM_PROMPT,
         checkpointer=checkpointer,
-    )
-
-
-def build_framework_agent(model, tools, checkpointer):
-    """保留 create_agent 版本，用于和手写图对照。
-
-    create_agent 是 LangChain 1.x 当前推荐的高层入口，内部运行在 LangGraph 上。
-    它会自动完成：模型思考 -> 申请工具 -> 执行工具 -> 把结果交还模型 -> 最终回答。
-
-    生产里它更省事（工具报错处理、并行工具调用这些细节框架都做了），
-    但代价是循环结构不出现在你的代码里，讲不清楚。
-    """
-
-    return create_agent(
-        model=model,
-        tools=tools,
-        system_prompt=SYSTEM_PROMPT,
-        checkpointer=checkpointer,
-        name="common_agent",
     )
