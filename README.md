@@ -100,7 +100,7 @@ common_agent/
 ├─ mcp_servers/
 │  └─ common_tools_server.py # 真正独立的 MCP 2.x stdio Server
 ├─ workspace/
-│  ├─ welcome.md             # Agent 可操作的真实工作区
+│  ├─ notes/                 # Agent 运行中自己生成的文件（不提交）
 │  └─ knowledge/             # RAG 文档目录
 ├─ data/
 │  ├─ agent.sqlite           # 对话 checkpoint
@@ -151,7 +151,7 @@ PowerShell：
 第一次可以输入：
 
 ```text
-请列出工作区文件，并读取 welcome.md，告诉我项目代号。
+请列出工作区文件，并在 notes 下新建一个 hello.md 写入一句问候。
 ```
 
 终端会把模型的工具决定、工具真实返回和最终答案分开显示。透明轨迹非常重要：

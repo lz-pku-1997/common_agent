@@ -41,7 +41,7 @@ def print_help() -> None:
   /exit              退出程序
 
 可以这样试：
-  请列出工作区文件，并读取 welcome.md，告诉我项目代号。
+  请列出工作区文件。
   请在 notes 目录新建 first_note.md，内容是“我们完成了真实工具调用”。
   请为 knowledge 建立索引，再检索 RAG 验证暗号并附来源。
   请使用 MCP 工具计算 37+58，并读取当前时间。
