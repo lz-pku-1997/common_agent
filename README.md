@@ -9,7 +9,7 @@
 - 真实持久化：LangGraph checkpoint 写入 SQLite，同一 `thread_id` 重启后仍能续聊。
 - 真实安全边界：工具只能访问本项目 `workspace`，不能用 `../` 逃出去，不能覆盖文件。
 - 真实交互入口：既能在 PyCharm 运行，也能在 PowerShell 连续聊天。
-- 真实验收：本地单元测试验证工具；联网 smoke test 验证“模型 → 工具 → 模型”和 SQLite。
+- 真实交互链路：可以直接体验“模型 → 工具 → 模型”和 SQLite 会话续聊。
 
 它仍然不包含数据分析、多智能体、复杂规划或自主执行；这些是两台电脑分叉后的业务能力。
 但 RAG 和 MCP 是两条方向都会复用的标准接入能力，因此已经作为真实、最小、完整的参考实现纳入共同基线。
@@ -67,9 +67,7 @@ common_agent/
 │  ├─ agent.py               # 模型 + 三类工具 + Agent 图
 │  ├─ display.py             # 把执行轨迹显示给人
 │  ├─ cli.py                 # 异步多轮命令行产品入口
-│  ├─ rag_smoke_test.py      # RAG 独立真实验收
-│  ├─ mcp_smoke_test.py      # MCP 独立真实验收
-│  └─ smoke_test.py          # Agent + RAG + MCP 联合验收
+│  └─ cli.py                 # 异步多轮命令行产品入口
 ├─ mcp_servers/
 │  └─ common_tools_server.py # 真正独立的 MCP 2.x stdio Server
 ├─ workspace/
@@ -78,7 +76,6 @@ common_agent/
 ├─ data/
 │  ├─ agent.sqlite           # 对话 checkpoint
 │  └─ knowledge.sqlite       # RAG 文本块与向量
-├─ tests/test_local.py       # 8 项不联网测试
 ├─ .env                      # 本机真实密钥，已被 gitignore
 ├─ .env.example              # 可分享的配置模板，无密钥
 └─ requirements.txt          # 锁定依赖版本
@@ -87,10 +84,9 @@ common_agent/
 推荐按这个顺序学习：
 
 1. `config.py` → `workspace_tools.py`：先复习配置和普通工具。
-2. `rag_tools.py` → `rag_smoke_test.py`：看清完整 RAG 数据链路。
-3. `common_tools_server.py` → `mcp_bridge.py` → `mcp_smoke_test.py`：看清 MCP 的两个进程。
+2. `rag_tools.py`：看清完整 RAG 数据链路。
+3. `common_tools_server.py` → `mcp_bridge.py`：看清 MCP 的两个进程。
 4. `agent.py` → `cli.py`：理解三类工具如何汇入同一个 Agent。
-5. `smoke_test.py`：看端到端验收如何防止“看起来能跑”。
 
 ## 4. 第一次安装
 
@@ -132,7 +128,7 @@ PowerShell：
 终端会把模型的工具决定、工具真实返回和最终答案分开显示。透明轨迹非常重要：
 否则模型即使没有查文件，我们也可能误以为它查过了。
 
-继续测试写工具：
+继续体验写工具：
 
 ```text
 请在 notes 目录新建 first_note.md，内容是“我们完成了真实工具调用”。
@@ -140,7 +136,7 @@ PowerShell：
 
 再让它列目录或读取该文件，就能看到真实落盘结果。再次用同名文件写入会被拒绝，不会悄悄覆盖。
 
-测试 RAG：
+体验 RAG：
 
 ```text
 请先为 knowledge 目录建立知识索引，再用知识库回答：共享内核的 RAG 验证暗号是什么？请附来源。
@@ -148,7 +144,7 @@ PowerShell：
 
 第一次建库会真实调用 Embedding API；文件没有变化时再次建库会根据 SHA-256 摘要跳过，避免重复消耗额度。
 
-测试 MCP：
+体验 MCP：
 
 ```text
 请使用 MCP 工具准确计算 37+58，并读取 MCP Server 所在电脑的当前时间。
@@ -168,41 +164,10 @@ PowerShell：
 
 这里的 SQLite 是对话短期记忆/运行状态，不是公共记忆知识库。两者目的不同，不能混为一谈。
 
-## 7. 测试与验收
+## 7. 当前学习主线
 
-不联网测试：
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest tests.test_local -v
-```
-
-RAG 独立验收（真实消耗少量 Embedding 额度）：
-
-```powershell
-.\.venv\Scripts\python.exe -m app.rag_smoke_test
-```
-
-MCP 独立验收（本机跨进程，不调用聊天模型）：
-
-```powershell
-.\.venv\Scripts\python.exe -m app.mcp_smoke_test
-```
-
-完整联网验收（真实消耗聊天模型和 Embedding 额度）：
-
-```powershell
-.\.venv\Scripts\python.exe -m app.smoke_test
-```
-
-联网验收不是只检查“返回了一段文字”。它会断言：
-
-1. RAG 真实建立或复用 `text-embedding-v4` 向量索引；
-2. 模型实际调用了 `search_knowledge_base`；
-3. 模型实际通过 MCP 调用了 `add_numbers`；
-4. 最终回答包含检索暗号、文件 source 和 MCP 计算结果 95；
-5. 关闭并重开 SQLite 后，完整消息与工具调用链仍可恢复。
-
-任一条件不成立，程序会直接报错，不会把失败包装成成功。
+当前只沿着产品主线阅读和开发：配置 → 工作区工具 → RAG → MCP → Agent 组装 → CLI 会话。
+当前主线不包含评测/eval 目录和验收脚本；等核心能力完成后另行设计，不要在现在的阅读过程中寻找它们。
 
 ## 8. 当前安全边界
 
@@ -219,12 +184,12 @@ MCP 独立验收（本机跨进程，不调用聊天模型）：
 
 ## 9. 两台电脑分叉时复制什么
 
-本项目整体就是共同基线。确认学懂和验收通过后，两台电脑分别复制/克隆同一个版本，再各自加业务工具：
+本项目整体就是共同基线。确认主线能力学懂并能运行后，两台电脑分别复制/克隆同一个版本，再各自加业务工具：
 
-- 数据分析方向以后增加表格读取、数据检查、Python 沙箱、图表和分析评测，复用当前 RAG/MCP 接口。
-- 通用深度方向以后增加网络搜索、任务规划、HITL、子 Agent 和更完整评测，复用当前 RAG/MCP 接口。
+- 数据分析方向以后增加表格读取、数据检查、Python 沙箱和图表，复用当前 RAG/MCP 接口。
+- 通用深度方向以后增加网络搜索、任务规划、HITL 和子 Agent，复用当前 RAG/MCP 接口。
 
-当前阶段不实现这些分支。共同内核的完成标准，就是本 README 第 7 节全部真实验收通过。
+当前阶段不实现这些分支。共同内核的完成标准，是第 1～6 节的主线能力能够被读懂、运行并逐步接入手写循环。
 
 ## 10. 一个重要的版本事实
 
@@ -243,6 +208,16 @@ MCP 独立验收（本机跨进程，不调用聊天模型）：
 本项目是完整的最小向量 RAG，但还不是企业搜索平台：
 
 - 已有：切块、重叠、内容哈希增量索引、真实 Embedding、SQLite 向量保存、余弦召回、来源引用。
-- 未有：PDF/Word 解析、混合检索、rerank、权限过滤、大规模 ANN 向量数据库和 RAG 评测集。
+- 未有：PDF/Word 解析、混合检索、rerank、权限过滤和大规模 ANN 向量数据库。
 
 这些未有能力不是共同内核必须项，应在具体业务分支出现真实需求时增加。
+
+## 12. TODO：升级为真正的向量数据库检索
+
+- [ ] 用主流向量检索方案替换当前“从 SQLite `fetchall()` 全部向量，再在 Python 内逐条计算余弦相似度”的教学实现。
+- [ ] 优先评估 PostgreSQL + pgvector；如果项目更适合独立向量数据库，再评估 Qdrant。
+- [ ] 让数据库或向量索引直接完成 ANN / Top-K 候选召回，查询时只把少量相关文本块返回 Python，避免知识库扩大后占满内存。
+- [ ] 保留文档路径、分块编号、Embedding 模型等元数据，并支持按业务字段过滤。
+- [ ] 增加增量索引、空知识库和较大数据量下的工程测试；混合检索与 rerank 暂留到向量库改造之后再决定。
+
+这项改造暂不在当前源码阅读阶段实施；先把共同内核现有链路读完，再单独设计和迁移。
