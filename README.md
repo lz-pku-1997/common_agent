@@ -20,7 +20,7 @@
 用户在 CLI 输入问题
         │
         ▼
-LangChain create_agent（内部由 LangGraph 驱动循环）
+app/manual_loop.py 手写的图（默认引擎）
         │
         ├─ 模型能直接回答 ──────────────────────┐
         │                                       │
@@ -39,11 +39,40 @@ LangChain create_agent（内部由 LangGraph 驱动循环）
 
 这里最关键的不是“调用了一次大模型”，而是形成了闭环：模型能观察工具结果，再决定继续调用工具还是回答。
 
-## 2. 为什么使用 `create_agent`
+## 2. 为什么手写主循环（以及为什么还留着 `create_agent`）
 
-LangGraph 1.x 已经把推荐的高层 Agent 入口放到 `langchain.agents.create_agent`。
-我们在 01–19 章手写过 State、节点、边、工具循环和 checkpoint；作品阶段可以使用官方高层入口，
-把精力放在工具质量、安全边界和产品行为上。它底层仍然运行在 LangGraph 上，并没有绕开所学知识。
+`app/manual_loop.py` 里的图只有四个零件：两个节点、两条条件边。
+
+```text
+START ──> [model] ──有 tool_calls──> [tools] ──没转够──> [model]
+             │                          │
+             │ 没有 tool_calls          │ 转够 MAX_TOOL_ROUNDS
+             v                          v
+            END                        END
+```
+
+**两条结束路径的含义完全不同，这是整个项目最值得讲的一点：**
+
+| 结束路径 | 谁决定的 | 含义 |
+| --- | --- | --- |
+| `model -> END` | 模型 | **正常出口**。模型不再申请工具，说明它认为信息够了 |
+| `tools -> END` | 代码 | **保险丝**。转够 10 轮被强制掐断，不是正常结束 |
+
+为什么必须有第二条？因为第一条只在模型「自己愿意停」时才生效。
+模型可以一直申请工具把轮数耗完 —— 光靠模型自觉防不住转圈。
+
+**那么为什么还保留 `create_agent`？**
+
+把 `.env` 里的 `COMMON_AGENT_ENGINE` 设成 `framework` 就能切回去。
+保留两套不是为了炫技，是为了能回答「两套你都写过，差别在哪」：
+
+- 手写图：每条边都在代码里，能指着某一行回答「循环什么时候停」；代价是工具并行、
+  错误分类这些细节都得自己补。
+- `create_agent`：这些细节框架都做了，代码更短；代价是循环结构不出现在你的代码里。
+
+工具报错的处理也体现了同一个取舍：`run_tools` **不往外抛异常**，
+而是把错误变成一条 `ToolMessage` 还给模型 —— 由模型决定是换参数重试、
+换工具，还是如实告诉用户。这是 Agent 和普通脚本的本质区别。
 
 官方资料：
 
@@ -64,9 +93,9 @@ common_agent/
 │  ├─ workspace_tools.py     # 四个真实工具与安全边界
 │  ├─ rag_tools.py           # 切块、真实 Embedding、SQLite 向量检索
 │  ├─ mcp_bridge.py          # MCP 动态发现到 LangChain 工具的桥
-│  ├─ agent.py               # 模型 + 三类工具 + Agent 图
+│  ├─ manual_loop.py         # 手写主循环：两个节点 + 两条条件边（默认引擎）
+│  ├─ agent.py               # 模型 + 三类工具 + 引擎选择
 │  ├─ display.py             # 把执行轨迹显示给人
-│  ├─ cli.py                 # 异步多轮命令行产品入口
 │  └─ cli.py                 # 异步多轮命令行产品入口
 ├─ mcp_servers/
 │  └─ common_tools_server.py # 真正独立的 MCP 2.x stdio Server

@@ -10,7 +10,12 @@ import asyncio
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from app.agent import build_common_agent
-from app.config import DATABASE_PATH, load_model_settings, prepare_runtime_directories
+from app.config import (
+    DATABASE_PATH,
+    load_agent_engine,
+    load_model_settings,
+    prepare_runtime_directories,
+)
 from app.display import print_new_execution_trace
 
 
@@ -48,9 +53,13 @@ async def main_async() -> None:
     prepare_runtime_directories()
     settings = load_model_settings()
 
+    engine = load_agent_engine()
+    engine_label = "自己画的图（manual_loop.py）" if engine == "manual" else "框架生成（create_agent）"
+
     print("=" * 62)
     print("common_agent v1.0：真实模型 + 文件工具 + 向量 RAG + MCP + SQLite")
     print(f"当前模型：{settings['model']}")
+    print(f"当前引擎：{engine_label}")
     print("安全边界：工具只能访问本项目的 workspace，且不能覆盖已有文件。")
     print("=" * 62)
 

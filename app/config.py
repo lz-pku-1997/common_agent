@@ -66,6 +66,16 @@ def load_embedding_settings() -> dict[str, str | int]:
     }
 
 
+def load_agent_engine() -> str:
+    """选择用哪套 Agent 引擎：`manual`（自己画的图）或 `framework`（create_agent）。
+
+    两套都保留是为了对照。默认走 manual，因为它每一步都能解释。
+    """
+
+    engine = os.getenv("COMMON_AGENT_ENGINE", "manual").strip().lower()
+    return engine if engine in {"manual", "framework"} else "manual"
+
+
 def prepare_runtime_directories() -> None:
     """确保运行时目录存在。
 
