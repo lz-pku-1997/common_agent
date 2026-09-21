@@ -86,8 +86,8 @@ common_agent/
 │  ├─ workspace_tools.py     # 四个真实工具与安全边界
 │  ├─ rag_tools.py           # 切块、真实 Embedding、SQLite 向量检索
 │  ├─ mcp_bridge.py          # MCP 动态发现到 LangChain 工具的桥
-│  ├─ manual_loop.py         # 手写主循环：两个节点 + 两条条件边（默认引擎）
-│  ├─ agent.py               # 模型 + 三类工具 + 引擎选择
+│  ├─ manual_loop.py         # 手写主循环：两个节点 + 两条条件边（唯一引擎）
+│  ├─ agent.py               # 模型 + 三类工具 + 组装图
 │  ├─ display.py             # 把执行轨迹显示给人
 │  └─ cli.py                 # 异步多轮命令行产品入口
 ├─ mcp_servers/
@@ -190,6 +190,8 @@ PowerShell：
 
 当前只沿着产品主线阅读和开发：配置 → 工作区工具 → RAG → MCP → Agent 组装 → CLI 会话。
 当前主线不包含评测/eval 目录和验收脚本；等核心能力完成后另行设计，不要在现在的阅读过程中寻找它们。
+
+项目总路线请看：`00_项目完善路线图_融合最终版.md`。
 
 ## 8. 当前安全边界
 
