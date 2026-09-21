@@ -33,7 +33,7 @@ r"""手写的 Agent 主循环：把「模型 -> 工具 -> 再问模型」一步�
 把轮数耗完 —— 光靠模型自觉防不住转圈。
 """
 
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
@@ -41,7 +41,9 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 
-# 最多转多少轮工具。超过就强制结束，避免模型一直要工具把钱烧光。
+# 最多允许完成多少轮“模型申请工具 → 执行工具 → 回到模型”。
+# 达到这个数后，工具节点仍会把本轮结果写回 State，但不会再回到模型节点。
+# 这是防止模型因反复申请工具而无限循环、持续消耗时间和额度的保险丝。
 MAX_TOOL_ROUNDS = 10
 
 
@@ -63,34 +65,38 @@ class AgentState(TypedDict):
 def build_agent_graph(model, tools: list[BaseTool], system_prompt: str, checkpointer=None):
     """把上面的图画出来并编译。
 
+    这个函数只负责三件事：
+
+    1. 把工具对象整理成“工具名 -> 工具对象”的本地查找表；
+    2. 定义两个节点：`model` 负责决策，`tools` 负责执行；
+    3. 用两条条件边把循环和两个出口连起来。
+
     返回的是 LangGraph 的 CompiledStateGraph，上层用 `ainvoke` / `aget_state` 驱动。
 
     参数里的 checkpointer 由外层传入：SQLite 连接必须在使用期间保持打开。
     """
 
-    # 工具注册表：把「模型给的工具名」映射到「真正能执行的对象」。
-    # 模型只会给出一个字符串名字，能不能执行、执行什么，完全由这张表决定。
-    tool_registry: dict[str, BaseTool] = {tool.name: tool for tool in tools}
+    # 这是 build_agent_graph 内部的快速查找表，不是项目级的工具 Registry。
+    # 模型返回的 tool_call 只有一个字符串名字，例如 "read_file"；
+    # 执行节点用这个名字在表里找到真正的 BaseTool 对象，再调用它的 ainvoke。
+    tools_by_name: dict[str, BaseTool] = {tool.name: tool for tool in tools}
 
     # bind_tools 把工具的 JSON Schema 交给模型，但不执行任何东西。
-    # 模型拿到的只是「说明书」，真正动手的永远是 run_tools。
+    # 模型拿到的只是“说明书”；真正动手的永远是下面的 execute_tools_node。
     model_with_tools = model.bind_tools(tools)
 
-    async def call_model(state: AgentState) -> dict:
+    async def call_model_node(state: AgentState) -> dict[str, Any]:
         """模型节点：把到目前为止的对话交给模型，让它决定「直接回答」还是「要调工具」。"""
 
-        messages = list(state["messages"])
-
-        # SystemMessage 只在第一轮补上。之后它已经留在 messages 里，
-        # 每一轮都重新塞一遍只会白白多花 token。
-        if not any(isinstance(message, SystemMessage) for message in messages):
-            messages = [SystemMessage(content=system_prompt), *messages]
+        # system_prompt 不写回 State，而是在每次真正调用模型前临时放到请求最前面。
+        # 必须每轮都加：Chat API 是无状态的，历史消息里不会自己带着系统提示。
+        messages = [SystemMessage(content=system_prompt), *state["messages"]]
 
         response = await model_with_tools.ainvoke(messages)
-        # 只返回「这一刀新增了什么」，不返回整个 State —— 合并由框架按 reducer 做。
+        # 节点只返回这一步新增的消息；完整 State 由 LangGraph 按 reducer 合并。
         return {"messages": [response]}
 
-    async def run_tools(state: AgentState) -> dict:
+    async def execute_tools_node(state: AgentState) -> dict[str, Any]:
         """工具节点：真的执行上一轮模型申请的工具，把结果回填成 ToolMessage。
 
         这里有一条重要原则：**工具报错不往外抛，而是变成一条「失败的结果」还给模型。**
@@ -100,22 +106,28 @@ def build_agent_graph(model, tools: list[BaseTool], system_prompt: str, checkpoi
         这也是 Agent 和普通脚本的本质区别：出错之后由模型决定下一步，不是由代码写死。
         """
 
-        tool_calls = state["messages"][-1].tool_calls
+        # route_after_model 只有在最后一条消息带有 tool_calls 时才会把流程送到这里。
+        # 这里仍然按“可能没有、可能是空”取值，让节点不依赖上游一定传对：
+        # 属性缺失或值为 None 都按“本轮没有工具调用”处理，而不是抛 TypeError。
+        last_message = state["messages"][-1]
+        tool_calls = getattr(last_message, "tool_calls", None) or []
         results: list[ToolMessage] = []
 
         for call in tool_calls:
-            tool = tool_registry.get(call["name"])
+            tool_name = call["name"]
+            tool = tools_by_name.get(tool_name)
 
             if tool is None:
                 # 模型调了一个不存在的工具。不要崩，让它知道自己错了，给它改正的机会。
-                available = ", ".join(sorted(tool_registry))
-                content = f"工具不存在：{call['name']}。可用的工具有：{available}。"
+                available = ", ".join(sorted(tools_by_name))
+                content = f"工具不存在：{tool_name}。可用的工具有：{available}。"
             else:
                 try:
                     # ainvoke 对同步工具和异步（MCP）工具都能用。
                     content = str(await tool.ainvoke(call["args"]))
                 except Exception as error:
-                    # 只把错误类型和说明交给模型，不把堆栈和内部对象泄漏出去。
+                    # 不把 Python 堆栈交给模型，只把可读的错误类型和消息变成 ToolMessage。
+                    # 模型随后可以基于这条失败结果决定重试、换工具或如实说明失败。
                     content = f"工具执行失败：{type(error).__name__}: {error}"
 
             results.append(ToolMessage(content=content, tool_call_id=call["id"]))
@@ -149,8 +161,8 @@ def build_agent_graph(model, tools: list[BaseTool], system_prompt: str, checkpoi
         return "model"
 
     graph = StateGraph(AgentState)
-    graph.add_node("model", call_model)
-    graph.add_node("tools", run_tools)
+    graph.add_node("model", call_model_node)
+    graph.add_node("tools", execute_tools_node)
 
     graph.add_edge(START, "model")
     graph.add_conditional_edges("model", route_after_model, {"tools": "tools", END: END})
