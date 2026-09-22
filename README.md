@@ -4,6 +4,7 @@
 
 - 真实模型：通过 OpenAI 兼容协议调用 `.env` 中配置的模型；当前是千问。
 - 真实工具循环：模型自己选择工具，工具真的读取或新建本地文件，再把结果交还模型。
+- 工具治理登记：在 LangChain Tool 之上记录工具来源、allow/ask/deny 权限、风险和可用范围。
 - 真实向量 RAG：文档切块，调用百炼 `text-embedding-v4`，向量存入 SQLite，语义检索返回原文与 source。
 - 真实 MCP：官方 MCP Python SDK 2.2.0；Client 通过 stdio 启动独立 Server，动态发现 Schema 并调用工具。
 - 真实持久化：LangGraph checkpoint 写入 SQLite，同一 `thread_id` 重启后仍能续聊。
@@ -38,6 +39,8 @@ app/manual_loop.py 手写的图（唯一引擎）
 ```
 
 这里最关键的不是“调用了一次大模型”，而是形成了闭环：模型能观察工具结果，再决定继续调用工具还是回答。
+
+工具治理采用三档 `allow / ask / deny`，并已经接入工具节点的真实分发：`allow` 才进入 `tool.ainvoke`，`ask` 通过 LangGraph `interrupt` 暂停，CLI 用 `Command(resume=...)` 恢复后才执行，`deny` 直接拒绝。后续 M7 只继续补取消、幂等和更复杂的审批恢复，不重复实现这条最小 HITL 链路。
 
 ## 2. 为什么手写主循环
 
@@ -86,6 +89,7 @@ common_agent/
 │  ├─ workspace_tools.py     # 四个真实工具与安全边界
 │  ├─ rag_tools.py           # 切块、真实 Embedding、SQLite 向量检索
 │  ├─ mcp_bridge.py          # MCP 动态发现到 LangChain 工具的桥
+│  ├─ tool_registry.py       # 工具契约、来源、权限和风险登记表
 │  ├─ manual_loop.py         # 手写主循环：两个节点 + 两条条件边（唯一引擎）
 │  ├─ agent.py               # 模型 + 三类工具 + 组装图
 │  ├─ display.py             # 把执行轨迹显示给人
@@ -108,7 +112,8 @@ common_agent/
 1. `config.py` → `workspace_tools.py`：先复习配置和普通工具。
 2. `rag_tools.py`：看清完整 RAG 数据链路。
 3. `common_tools_server.py` → `mcp_bridge.py`：看清 MCP 的两个进程。
-4. `agent.py` → `cli.py`：理解三类工具如何汇入同一个 Agent。
+4. `tool_registry.py` → `agent.py`：理解工具如何登记、筛选后汇入同一个 Agent。
+5. `cli.py`：理解外层如何启动和持续运行会话。
 
 ## 4. 第一次安装
 

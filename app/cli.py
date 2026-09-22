@@ -8,6 +8,7 @@ import re
 import asyncio
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.types import Command
 
 from app.agent import build_common_agent
 from app.config import (
@@ -46,6 +47,39 @@ def print_help() -> None:
   请使用 MCP 工具计算 37+58，并读取当前时间。
 """.strip()
     )
+
+
+async def invoke_with_human_approval(agent, user_input: str, config: dict) -> dict:
+    """运行一轮 Agent，并在 LangGraph interrupt 时等待用户确认。
+
+    普通调用返回最终 State；如果工具策略是 ``ask``，第一次调用会暂停并返回
+    ``__interrupt__``。这里把待确认信息展示给用户，再用同一个 thread_id 发送
+    ``Command(resume=...)``，LangGraph 就会从原来的工具节点继续，而不是重新
+    开启一轮无关的对话。
+    """
+
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": user_input}]}, config=config)
+
+    while result.get("__interrupt__"):
+        interruption = result["__interrupt__"][0]
+        request = getattr(interruption, "value", {})
+        print("\n[需要人工确认]")
+        print(request.get("message", "Agent 请求执行受保护工具。"))
+        for item in request.get("tools", []):
+            print(f"  工具：{item['name']}")
+            print(f"  参数：{item.get('args', {})}")
+
+        answer = input("是否批准执行？输入 y 批准，其他任何内容都拒绝：").strip().lower()
+        approved = answer in {"y", "yes", "是", "同意"}
+
+        # resume 的值会作为 interrupt(...) 的返回值交回节点；节点随后才会
+        # 进入 ask 工具的 ainvoke。拒绝时也要 resume，不能让图永远停在断点。
+        result = await agent.ainvoke(
+            Command(resume={"approved": approved}),
+            config=config,
+        )
+
+    return result
 
 
 async def main_async() -> None:
@@ -104,10 +138,7 @@ async def main_async() -> None:
             old_messages = old_state.values.get("messages", []) if old_state.values else []
 
             try:
-                result = await agent.ainvoke(
-                    {"messages": [{"role": "user", "content": user_text}]},
-                    config=config,
-                )
+                result = await invoke_with_human_approval(agent, user_text, config)
                 print_new_execution_trace(result["messages"], len(old_messages))
             except Exception as error:
                 # 终端应用不能把密钥或完整内部对象打印出来，只给用户错误类型与说明。

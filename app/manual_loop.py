@@ -40,6 +40,9 @@ from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.types import interrupt
+
+from app.tool_registry import ToolRegistry
 
 
 # 最多允许完成多少轮“模型申请工具 → 执行工具 → 回到模型”。
@@ -91,7 +94,13 @@ class AgentState(TypedDict):
     stop_reason: str | None
 
 
-def build_agent_graph(model, tools: list[BaseTool], system_prompt: str, checkpointer=None):
+def build_agent_graph(
+    model,
+    tools: list[BaseTool],
+    system_prompt: str,
+    checkpointer=None,
+    tool_registry: ToolRegistry | None = None,
+):
     """把上面的图画出来并编译。
 
     这个函数只负责三件事：
@@ -105,10 +114,12 @@ def build_agent_graph(model, tools: list[BaseTool], system_prompt: str, checkpoi
     参数里的 checkpointer 由外层传入：SQLite 连接必须在使用期间保持打开。
     """
 
-    # 这是 build_agent_graph 内部的快速查找表，不是项目级的工具 Registry。
-    # 模型返回的 tool_call 只有一个字符串名字，例如 "read_file"；
-    # 执行节点用这个名字在表里找到真正的 BaseTool 对象，再调用它的 ainvoke。
-    tools_by_name: dict[str, BaseTool] = {tool.name: tool for tool in tools}
+    # 模型返回的 tool_call 只有一个字符串名字，例如 "read_text_file"；
+    # 这里优先使用项目级 Registry 的查找表，确保“模型看到的工具”和“执行时
+    # 能找到的工具”来自同一份登记。没有传 Registry 时仍保留普通列表兼容性。
+    tools_by_name: dict[str, BaseTool] = (
+        tool_registry.as_tool_map() if tool_registry else {tool.name: tool for tool in tools}
+    )
 
     # bind_tools 把工具的 JSON Schema 交给模型，但不执行任何东西。
     # 模型拿到的只是“说明书”；真正动手的永远是下面的 execute_tools_node。
@@ -159,20 +170,95 @@ def build_agent_graph(model, tools: list[BaseTool], system_prompt: str, checkpoi
         last_tool_call_signature = state.get("last_tool_call_signature")
         stop_reason = state.get("stop_reason")
 
+        # 先找出本轮所有 ask 工具，再统一请求一次确认。
+        # 不能先执行 allow 工具、执行到 ask 才 interrupt：LangGraph 从 interrupt
+        # 恢复时会重新运行当前节点，前面已经产生的副作用可能被重复执行。
+        ask_calls: list[dict[str, Any]] = []
+        if tool_registry is not None:
+            for call in tool_calls:
+                try:
+                    policy = tool_registry.policy_for(call["name"])
+                except KeyError:
+                    continue
+                if (
+                    policy.permission == "ask"
+                    and _tool_call_signature(call) != last_tool_call_signature
+                ):
+                    ask_calls.append(call)
+
+        approval_granted = True
+        if ask_calls:
+            approval = interrupt(
+                {
+                    "type": "tool_approval",
+                    "message": "Agent 请求执行需要人工确认的工具。",
+                    "tools": [
+                        {
+                            "name": call["name"],
+                            "args": call.get("args", {}),
+                            "tool_call_id": call["id"],
+                        }
+                        for call in ask_calls
+                    ],
+                }
+            )
+            # 当前 CLI 用 {"approved": True/False} 恢复；为了让 API 调用方
+            # 更容易使用，也兼容直接传 True。
+            approval_granted = approval is True or (
+                isinstance(approval, dict) and approval.get("approved") is True
+            )
+
         for call in tool_calls:
             tool_name = call["name"]
             tool = tools_by_name.get(tool_name)
             signature = _tool_call_signature(call)
 
             if signature == last_tool_call_signature:
-                # 同样的请求已经执行过，再执行一次只会浪费模型额度，甚至造成副作用。
-                # 把原因作为工具结果交回 State，调用链仍然完整，路由再安全收口。
-                content = f"检测到重复工具请求：{tool_name}。相同参数已经执行过，本轮停止继续调用。"
+                # 无论工具最后会被 allow、ask 还是 deny，都不能让同一个请求
+                # 一直重复占用模型轮次。先做这层检查，再做权限分发。
+                content = f"检测到重复工具请求：{tool_name}。相同参数已经处理过，本轮停止继续调用。"
                 stop_reason = "repeated_tool_call"
                 results.append(ToolMessage(content=content, tool_call_id=call["id"]))
                 continue
 
+            # 记录本次请求。即使后面因为 ask 或 deny 没有真正执行，也要记住它，
+            # 防止模型下一轮不断重复同一个被拒绝的请求。
             last_tool_call_signature = signature
+
+            # 先查项目级权限策略，再决定能不能进入真实 handler。
+            # 这一步必须发生在 tool.ainvoke 之前；否则模型就能绕过 Registry，
+            # 直接让一个 ask/deny 工具产生副作用。
+            policy = None
+            if tool_registry is not None:
+                try:
+                    policy = tool_registry.policy_for(tool_name)
+                except KeyError:
+                    # 未登记的工具和不存在的工具一样，都不能执行。
+                    policy = None
+
+            if policy is not None and policy.permission == "deny":
+                # deny 是明确的策略拒绝，不把它伪装成“工具不存在”。
+                content = f"工具调用被权限策略拒绝：{tool_name}。当前 Agent 不允许使用它。"
+                results.append(ToolMessage(content=content, tool_call_id=call["id"]))
+                continue
+
+            if policy is not None and "common_agent" not in policy.availability:
+                # 工具可能登记过，但没有授权给当前 Agent 作用域。
+                content = f"工具调用被作用域策略拒绝：{tool_name}。当前 Agent 没有使用范围。"
+                results.append(ToolMessage(content=content, tool_call_id=call["id"]))
+                continue
+
+            if policy is not None and policy.permission == "ask":
+                if approval_granted:
+                    # 只有 interrupt 得到明确 True 后，才允许进入真实 handler。
+                    try:
+                        content = str(await tool.ainvoke(call["args"]))
+                    except Exception as error:
+                        content = f"工具执行失败：{type(error).__name__}: {error}"
+                else:
+                    content = f"工具未执行：{tool_name} 未获得人工确认。"
+                results.append(ToolMessage(content=content, tool_call_id=call["id"]))
+                continue
 
             if tool is None:
                 # 模型调了一个不存在的工具。不要崩，让它知道自己错了，给它改正的机会。
