@@ -4,7 +4,7 @@
 
 - 真实模型：通过 OpenAI 兼容协议调用 `.env` 中配置的模型；当前是千问。
 - 真实工具循环：模型自己选择工具，工具真的读取或新建本地文件，再把结果交还模型。
-- 工具治理登记：在 LangChain Tool 之上记录工具来源、allow/ask/deny 权限、风险和可用范围。
+- 工具治理登记：在 LangChain Tool 之上记录工具来源和 allow/ask/deny 权限。
 - 真实向量 RAG：文档切块，调用百炼 `text-embedding-v4`，向量存入 SQLite，语义检索返回原文与 source。
 - 真实 MCP：官方 MCP Python SDK 2.2.0；Client 通过 stdio 启动独立 Server，动态发现 Schema 并调用工具。
 - 真实持久化：LangGraph checkpoint 写入 SQLite，同一 `thread_id` 重启后仍能续聊。

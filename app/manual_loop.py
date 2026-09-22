@@ -173,7 +173,7 @@ def build_agent_graph(
         # 先找出本轮所有 ask 工具，再统一请求一次确认。
         # 不能先执行 allow 工具、执行到 ask 才 interrupt：LangGraph 从 interrupt
         # 恢复时会重新运行当前节点，前面已经产生的副作用可能被重复执行。
-        ask_calls: list[dict[str, Any]] = []
+        ask_requests: list[dict[str, Any]] = []
         if tool_registry is not None:
             for call in tool_calls:
                 try:
@@ -184,22 +184,21 @@ def build_agent_graph(
                     policy.permission == "ask"
                     and _tool_call_signature(call) != last_tool_call_signature
                 ):
-                    ask_calls.append(call)
-
-        approval_granted = True
-        if ask_calls:
-            approval = interrupt(
-                {
-                    "type": "tool_approval",
-                    "message": "Agent 请求执行需要人工确认的工具。",
-                    "tools": [
+                    ask_requests.append(
                         {
                             "name": call["name"],
                             "args": call.get("args", {}),
                             "tool_call_id": call["id"],
                         }
-                        for call in ask_calls
-                    ],
+                    )
+
+        approval_granted = True
+        if ask_requests:
+            approval = interrupt(
+                {
+                    "type": "tool_approval",
+                    "message": "Agent 请求执行需要人工确认的工具。",
+                    "tools": ask_requests,
                 }
             )
             # 当前 CLI 用 {"approved": True/False} 恢复；为了让 API 调用方
@@ -239,12 +238,6 @@ def build_agent_graph(
             if policy is not None and policy.permission == "deny":
                 # deny 是明确的策略拒绝，不把它伪装成“工具不存在”。
                 content = f"工具调用被权限策略拒绝：{tool_name}。当前 Agent 不允许使用它。"
-                results.append(ToolMessage(content=content, tool_call_id=call["id"]))
-                continue
-
-            if policy is not None and "common_agent" not in policy.availability:
-                # 工具可能登记过，但没有授权给当前 Agent 作用域。
-                content = f"工具调用被作用域策略拒绝：{tool_name}。当前 Agent 没有使用范围。"
                 results.append(ToolMessage(content=content, tool_call_id=call["id"]))
                 continue
 

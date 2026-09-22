@@ -57,14 +57,14 @@ async def build_common_agent(checkpointer):
 
     # MCP 工具不是写死在 Agent 里的：启动时先向 Server 请求工具清单和 JSON Schema。
     mcp_tools = await load_mcp_tools()
-    # 先登记来源和权限，再把当前作用域允许暴露的工具交给主循环。
+    # 先登记来源和权限，再把允许暴露的工具交给主循环。
     # LangChain 仍负责 Tool/Schema；Registry 只负责项目自己的治理元数据。
     tool_registry = build_tool_registry(WORKSPACE_TOOLS, RAG_TOOLS, mcp_tools)
     model = create_chat_model()
 
     return build_agent_graph(
         model=model,
-        tools=tool_registry.tools_for("common_agent"),
+        tools=tool_registry.tools_for_model(),
         tool_registry=tool_registry,
         system_prompt=SYSTEM_PROMPT,
         checkpointer=checkpointer,

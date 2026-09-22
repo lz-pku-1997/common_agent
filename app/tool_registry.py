@@ -5,10 +5,9 @@ LangChain 已经负责把 Python 函数包装成 Tool、生成参数 Schema，�
 
 * 工具从哪里来；
 * 工具默认采用 allow、ask 还是 deny；
-* 是否需要在 handler 前做参数校验；
-* 哪个 Agent 作用域可以看到它。
 
-当前版本先登记策略，不负责弹出人工确认。真正的 ask 执行流程属于后续 HITL 阶段。
+三档策略已经接入执行链：allow 直接执行，ask 触发 LangGraph interrupt，
+deny 直接拒绝。参数校验由各工具 handler 负责，不在这里重复登记一个布尔字段。
 """
 
 from dataclasses import dataclass
@@ -25,18 +24,12 @@ class ToolPolicy:
 
     ``permission`` 是三档决策：
     - allow：可以自动执行；
-    - ask：未来执行前需要人工确认；
+    - ask：执行前通过 LangGraph interrupt 请求人工确认；
     - deny：不应交给当前 Agent 执行。
-
-    ``parameter_validation`` 不是第四种权限，而是 allow/ask 之上的安全要求。
-    例如读文件可以 allow，但仍必须校验路径是否留在 workspace 内。
     """
 
     source: str
     permission: PermissionMode
-    risk: str
-    availability: tuple[str, ...] = ("common_agent",)
-    parameter_validation: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,9 +66,6 @@ class ToolRegistry:
         *,
         source: str,
         permission: PermissionMode,
-        risk: str,
-        availability: tuple[str, ...] = ("common_agent",),
-        parameter_validation: bool = True,
     ) -> None:
         """用同一组默认策略登记一批同来源工具。"""
 
@@ -85,30 +75,27 @@ class ToolRegistry:
                 ToolPolicy(
                     source=source,
                     permission=permission,
-                    risk=risk,
-                    availability=availability,
-                    parameter_validation=parameter_validation,
                 ),
             )
 
-    def tools_for(self, scope: str = "common_agent") -> list[BaseTool]:
-        """返回当前作用域允许暴露给模型的工具。
+    def tools_for_model(self) -> list[BaseTool]:
+        """返回允许暴露给模型的工具。
 
-        deny 工具不会进入模型的说明书；ask 工具仍会进入说明书，后续 HITL 节点
-        再根据策略决定是否暂停。这样“模型知道工具存在”和“工具可以直接执行”
+        deny 工具不会进入模型说明书；ask 工具仍会进入说明书，执行节点
+        再根据策略触发人工确认。这样“模型知道工具存在”和“工具可以直接执行”
         是两个明确的层次。
         """
 
         return [
             entry.tool
             for entry in self._entries.values()
-            if scope in entry.policy.availability and entry.policy.permission != "deny"
+            if entry.policy.permission != "deny"
         ]
 
-    def as_tool_map(self, scope: str = "common_agent") -> dict[str, BaseTool]:
+    def as_tool_map(self) -> dict[str, BaseTool]:
         """生成执行节点需要的“工具名 -> Tool”查找表。"""
 
-        return {tool.name: tool for tool in self.tools_for(scope)}
+        return {tool.name: tool for tool in self.tools_for_model()}
 
     def policy_for(self, tool_name: str) -> ToolPolicy:
         """按模型返回的工具名查策略；不存在的名字直接报错。"""
@@ -141,10 +128,9 @@ def build_tool_registry(
         workspace_read_tools,
         source="workspace",
         permission="allow",
-        risk="low",
     )
 
-    # 写文件会产生持久副作用，先登记为 ask；后续 HITL 阶段再真正接入确认节点。
+    # 写文件会产生持久副作用，因此登记为 ask；执行前会触发 HITL 确认。
     workspace_write_tools = [
         tool for tool in workspace_tools if tool.name == "save_new_text_file"
     ]
@@ -152,7 +138,6 @@ def build_tool_registry(
         workspace_write_tools,
         source="workspace",
         permission="ask",
-        risk="high",
     )
 
     # 建索引会写 SQLite 并消耗 Embedding 额度，因此属于 ask；纯检索是 allow。
@@ -163,7 +148,6 @@ def build_tool_registry(
             ToolPolicy(
                 source="rag",
                 permission="ask" if is_indexing else "allow",
-                risk="medium" if is_indexing else "low",
             ),
         )
 
@@ -173,7 +157,6 @@ def build_tool_registry(
         mcp_tools,
         source="mcp",
         permission="allow",
-        risk="medium",
     )
 
     return registry
