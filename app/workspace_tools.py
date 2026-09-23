@@ -109,7 +109,13 @@ def search_workspace_text(query: str, file_pattern: str = "*.md") -> str:
 
     matches: list[str] = []
     for path in sorted(WORKSPACE_ROOT.rglob(file_pattern)):
-        if not path.is_file() or path.stat().st_size > MAX_READ_BYTES:
+        # 扫描结果也可能是指向 workspace 外的符号链接；只读取校验后的真实路径。
+        path = path.resolve()
+        if (
+            not path.is_relative_to(WORKSPACE_ROOT)
+            or not path.is_file()
+            or path.stat().st_size > MAX_READ_BYTES
+        ):
             continue
 
         text = path.read_text(encoding="utf-8-sig", errors="replace")

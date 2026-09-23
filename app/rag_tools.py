@@ -127,8 +127,11 @@ def find_indexable_files(directory: Path) -> list[Path]:
 
     files: list[Path] = []
     for path in directory.rglob("*"):
+        # 逐个校验真实路径，避免目录内的符号链接把外部文件送去建立索引。
+        path = path.resolve()
         if (
-            path.is_file()
+            path.is_relative_to(WORKSPACE_ROOT)
+            and path.is_file()
             and path.suffix.lower() in RAG_FILE_SUFFIXES
             and path.stat().st_size <= MAX_READ_BYTES
         ):
