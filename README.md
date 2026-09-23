@@ -5,6 +5,7 @@
 - 真实模型：通过 OpenAI 兼容协议调用 `.env` 中配置的模型；当前是千问。
 - 真实工具循环：模型自己选择工具，工具真的读取或新建本地文件，再把结果交还模型。
 - 工具治理登记：在 LangChain Tool 之上记录工具来源和 allow/ask/deny 权限。
+- 工具数据隔离：workspace、RAG、MCP 的真实返回统一标记为不可信数据，不能获得指令权限。
 - 真实向量 RAG：文档切块，调用百炼 `text-embedding-v4`，向量存入 SQLite，语义检索返回原文与 source。
 - 真实 MCP：官方 MCP Python SDK 2.2.0；Client 通过 stdio 启动独立 Server，动态发现 Schema 并调用工具。
 - 真实持久化：LangGraph checkpoint 写入 SQLite，同一 `thread_id` 重启后仍能续聊。
@@ -64,11 +65,14 @@ START ──> [model] ──有 tool_calls──> [tools] ──没转够──>
 为什么必须有第二条？因为第一条只在模型「自己愿意停」时才生效。
 模型可以一直申请工具把轮数耗完 —— 光靠模型自觉防不住转圈。
 
-代价是：工具并行调用、错误分类这些细节都得自己补 —— 这正是后面几项要做的事。
+代价是：工具并行调用等细节需要自己决定和实现。
 
-`execute_tools_node` **不往外抛异常**，
-而是把错误变成一条 `ToolMessage` 还给模型 —— 由模型决定是换参数重试、
-换工具，还是如实告诉用户。这是 Agent 和普通脚本的本质区别。
+`execute_tools_node` 把工具失败写成 `status="error"` 的 `ToolMessage`。
+工具明确抛出 `RetryableError`，或入参不符合工具声明的参数结构（由框架校验层拦下）时，
+模型才有最多两次修改参数的机会；`NonRetryableError` 和未知异常立即收口。
+权限拒绝独立处理；用户拒绝人工确认后，
+模型会得到一次不带工具的回答机会，解释操作没有执行。
+MCP Server 正常返回的工具错误也属于有限改参重试；连接中断等异常仍安全收口。
 
 官方资料：
 
@@ -89,7 +93,8 @@ common_agent/
 │  ├─ workspace_tools.py     # 四个真实工具与安全边界
 │  ├─ rag_tools.py           # 切块、真实 Embedding、SQLite 向量检索
 │  ├─ mcp_bridge.py          # MCP 动态发现到 LangChain 工具的桥
-│  ├─ tool_registry.py       # 工具契约、来源、权限和风险登记表
+│  ├─ tool_registry.py       # 工具契约、来源和权限登记表
+│  ├─ tool_errors.py         # 可重试/不可重试的工具失败约定
 │  ├─ manual_loop.py         # 手写主循环：两个节点 + 两条条件边（唯一引擎）
 │  ├─ agent.py               # 模型 + 三类工具 + 组装图
 │  ├─ display.py             # 把执行轨迹显示给人

@@ -10,6 +10,7 @@ from pathlib import Path
 from langchain.tools import tool
 
 from app.config import WORKSPACE_ROOT
+from app.tool_errors import NonRetryableError, RetryableError
 
 
 ALLOWED_TEXT_SUFFIXES = {".md", ".txt", ".json", ".csv", ".py"}
@@ -35,7 +36,7 @@ def resolve_workspace_path(relative_path: str) -> Path:
 
     candidate = (WORKSPACE_ROOT / cleaned_path).resolve()
     if not candidate.is_relative_to(WORKSPACE_ROOT):
-        raise ValueError("拒绝访问：路径必须位于项目的 workspace 目录内。")
+        raise NonRetryableError("拒绝访问：路径必须位于项目的 workspace 目录内。")
     return candidate
 
 
@@ -44,7 +45,7 @@ def ensure_supported_text_file(path: Path) -> None:
 
     if path.suffix.lower() not in ALLOWED_TEXT_SUFFIXES:
         allowed = ", ".join(sorted(ALLOWED_TEXT_SUFFIXES))
-        raise ValueError(f"不支持 {path.suffix or '无后缀'} 文件；允许类型：{allowed}")
+        raise RetryableError(f"不支持 {path.suffix or '无后缀'} 文件；允许类型：{allowed}")
 
 
 @tool
@@ -53,9 +54,9 @@ def list_workspace_files(relative_directory: str = ".") -> str:
 
     directory = resolve_workspace_path(relative_directory)
     if not directory.exists():
-        raise ValueError(f"目录不存在：{relative_directory}")
+        raise RetryableError(f"目录不存在：{relative_directory}")
     if not directory.is_dir():
-        raise ValueError(f"这不是目录：{relative_directory}")
+        raise RetryableError(f"这不是目录：{relative_directory}")
 
     entries = sorted(directory.iterdir(), key=lambda item: (item.is_file(), item.name.lower()))
     if not entries:
@@ -79,12 +80,12 @@ def read_text_file(relative_path: str) -> str:
 
     path = resolve_workspace_path(relative_path)
     if not path.exists():
-        raise ValueError(f"文件不存在：{relative_path}")
+        raise RetryableError(f"文件不存在：{relative_path}")
     if not path.is_file():
-        raise ValueError(f"这不是文件：{relative_path}")
+        raise RetryableError(f"这不是文件：{relative_path}")
     ensure_supported_text_file(path)
     if path.stat().st_size > MAX_READ_BYTES:
-        raise ValueError("文件超过 1 MB。内核版拒绝一次性读取，以免撑爆模型上下文。")
+        raise RetryableError("文件超过 1 MB。内核版拒绝一次性读取，以免撑爆模型上下文。")
 
     # utf-8-sig 既能读取普通 UTF-8，也能自动去掉某些 Windows 文件开头的 BOM 标记。
     return path.read_text(encoding="utf-8-sig")
@@ -96,15 +97,15 @@ def search_workspace_text(query: str, file_pattern: str = "*.md") -> str:
 
     keyword = query.strip()
     if not keyword:
-        raise ValueError("搜索词不能为空。")
+        raise RetryableError("搜索词不能为空。")
 
     # 只接受“*.扩展名”，不让模型借 pattern 拼出 workspace 外的路径。
     if not file_pattern.startswith("*.") or "/" in file_pattern or "\\" in file_pattern:
-        raise ValueError("file_pattern 只能写成 '*.md'、'*.txt' 这一类形式。")
+        raise RetryableError("file_pattern 只能写成 '*.md'、'*.txt' 这一类形式。")
 
     suffix = file_pattern[1:].lower()
     if suffix not in ALLOWED_TEXT_SUFFIXES:
-        raise ValueError("这个文件类型不在允许搜索的范围内。")
+        raise RetryableError("这个文件类型不在允许搜索的范围内。")
 
     matches: list[str] = []
     for path in sorted(WORKSPACE_ROOT.rglob(file_pattern)):
@@ -132,9 +133,9 @@ def save_new_text_file(relative_path: str, content: str) -> str:
     ensure_supported_text_file(path)
 
     if path.exists():
-        raise ValueError(f"文件已存在，出于安全考虑不覆盖：{relative_path}")
+        raise RetryableError(f"文件已存在，出于安全考虑不覆盖：{relative_path}")
     if len(content) > MAX_WRITE_CHARACTERS:
-        raise ValueError("内容超过 10 万字符，内核版拒绝一次性写入。")
+        raise RetryableError("内容超过 10 万字符，内核版拒绝一次性写入。")
 
     # parents=True 会连同 notes/2026 这样的父目录一起建立。
     path.parent.mkdir(parents=True, exist_ok=True)

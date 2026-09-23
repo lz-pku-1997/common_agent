@@ -21,8 +21,19 @@ def message_content_to_text(content) -> str:
     return "\n".join(part for part in text_parts if part).strip()
 
 
-def print_new_execution_trace(messages: list, old_message_count: int) -> None:
-    """只打印本轮新增的工具轨迹，最后再打印 Agent 的最终回答。"""
+def print_new_execution_trace(
+    messages: list,
+    old_message_count: int,
+    stop_reason: str | None = None,
+    tool_rounds: int = 0,
+    max_tool_rounds: int | None = None,
+) -> None:
+    """只打印本轮新增的工具轨迹，最后再打印 Agent 的最终回答。
+
+    没有可显示的最终回答时，通常说明本轮被保险丝（重复请求 / 轮数上限）
+    收口了。这时用 stop_reason 和 tool_rounds 补一句具体原因，避免用户
+    把"没有输出"误读成"没有发生任何事"。
+    """
 
     new_messages = messages[old_message_count:]
     final_answer = ""
@@ -47,5 +58,17 @@ def print_new_execution_trace(messages: list, old_message_count: int) -> None:
 
     if final_answer:
         print(f"\ncommon_agent：{final_answer}")
+    elif stop_reason == "repeated_tool_call":
+        print("\ncommon_agent：因检测到重复工具请求而中止，本轮任务未完成。")
+    elif stop_reason == "retry_limit":
+        print("\ncommon_agent：参数修正次数已用完，本轮任务未完成。")
+    elif stop_reason == "permission_denied":
+        print("\ncommon_agent：工具调用被权限策略拒绝，本轮任务未完成。")
+    elif stop_reason == "approval_denied":
+        print("\ncommon_agent：你未批准工具操作，因此没有执行，本轮任务未完成。")
+    elif stop_reason == "non_retryable_error":
+        print("\ncommon_agent：工具发生不可重试错误，本轮任务已安全停止。")
+    elif max_tool_rounds is not None and tool_rounds >= max_tool_rounds:
+        print(f"\ncommon_agent：已达到 {max_tool_rounds} 轮工具上限，本轮任务未确认完成。")
     else:
         print("\ncommon_agent：本轮没有得到可显示的最终回答。")

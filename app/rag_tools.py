@@ -21,6 +21,7 @@ from langchain.tools import tool
 from langchain_openai import OpenAIEmbeddings
 
 from app.config import KNOWLEDGE_DATABASE_PATH, WORKSPACE_ROOT, load_embedding_settings
+from app.tool_errors import RetryableError
 from app.workspace_tools import MAX_READ_BYTES, resolve_workspace_path
 
 
@@ -141,7 +142,7 @@ def index_knowledge_base(relative_directory: str = ".") -> str:
 
     directory = resolve_workspace_path(relative_directory)
     if not directory.exists() or not directory.is_dir():
-        raise ValueError(f"知识目录不存在或不是目录：{relative_directory}")
+        raise RetryableError(f"知识目录不存在或不是目录：{relative_directory}")
 
     files = find_indexable_files(directory)
     if not files:
@@ -220,9 +221,9 @@ def search_knowledge_base(query: str, top_k: int = 4) -> str:
 
     question = query.strip()
     if not question:
-        raise ValueError("RAG 查询不能为空。")
+        raise RetryableError("RAG 查询不能为空。")
     if top_k < 1 or top_k > 8:
-        raise ValueError("top_k 必须在 1 到 8 之间。")
+        raise RetryableError("top_k 必须在 1 到 8 之间。")
     if not KNOWLEDGE_DATABASE_PATH.exists():
         return "知识库尚未建立。请先调用 index_knowledge_base。"
 

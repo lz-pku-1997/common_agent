@@ -9,10 +9,11 @@ import json
 import sys
 from pathlib import Path
 
-from langchain_core.tools import StructuredTool, ToolException
+from langchain_core.tools import StructuredTool
 from mcp import Client, StdioServerParameters
 
 from app.config import PROJECT_ROOT
+from app.tool_errors import RetryableError
 
 
 MCP_SERVER_PATH = PROJECT_ROOT / "mcp_servers" / "common_tools_server.py"
@@ -37,7 +38,9 @@ def mcp_result_to_text(result) -> str:
             for block in result.content
             if hasattr(block, "text")
         ]
-        raise ToolException("MCP 工具执行失败：" + "\n".join(error_parts))
+        # Server 正常返回的工具错误常是参数不符；给模型有限次改参机会。
+        # 连接中断等直接抛出的异常不会走这里，仍由主循环安全收口。
+        raise RetryableError("MCP 工具执行失败：" + "\n".join(error_parts))
 
     if result.structured_content is not None:
         return json.dumps(result.structured_content, ensure_ascii=False)
@@ -82,7 +85,6 @@ async def load_mcp_tools() -> list[StructuredTool]:
                 description=discovered_tool.description or "来自 MCP Server 的工具",
                 args_schema=discovered_tool.input_schema,
                 coroutine=create_mcp_coroutine(discovered_tool.name),
-                handle_tool_error=True,
                 metadata={"source": "mcp", "server": "common-tools"},
             )
         )

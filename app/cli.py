@@ -11,6 +11,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
 from app.agent import build_common_agent
+from app.manual_loop import MAX_TOOL_ROUNDS
 from app.config import (
     DATABASE_PATH,
     load_model_settings,
@@ -139,7 +140,13 @@ async def main_async() -> None:
 
             try:
                 result = await invoke_with_human_approval(agent, user_text, config)
-                print_new_execution_trace(result["messages"], len(old_messages))
+                print_new_execution_trace(
+                    result["messages"],
+                    len(old_messages),
+                    stop_reason=result.get("stop_reason"),
+                    tool_rounds=result.get("tool_rounds", 0),
+                    max_tool_rounds=MAX_TOOL_ROUNDS,
+                )
             except Exception as error:
                 # 终端应用不能把密钥或完整内部对象打印出来，只给用户错误类型与说明。
                 print(f"\n[本轮失败] {type(error).__name__}: {error}")
