@@ -9,6 +9,7 @@
 - 真实向量 RAG：文档切块，调用百炼 `text-embedding-v4`，向量存入 SQLite，语义检索返回原文与 source。
 - 真实 MCP：官方 MCP Python SDK 2.2.0；Client 通过 stdio 启动独立 Server，动态发现 Schema 并调用工具。
 - 真实持久化：LangGraph checkpoint 写入 SQLite，同一 `thread_id` 重启后仍能续聊。
+- 上下文预算：工具单条结果限长；历史接近预算时滚动摘要旧消息，原始 checkpoint 仍保留。
 - 真实安全边界：工具只能访问本项目 `workspace`，不能用 `../` 逃出去，不能覆盖文件。
 - 真实交互入口：既能在 PyCharm 运行，也能在 PowerShell 连续聊天。
 - 真实交互链路：可以直接体验“模型 → 工具 → 模型”和 SQLite 会话续聊。
@@ -45,15 +46,26 @@ app/manual_loop.py 手写的图（唯一引擎）
 
 ## 2. 为什么手写主循环
 
-`app/manual_loop.py` 里的图只有四个零件：两个节点、两条条件边。
+`app/manual_loop.py` 的主循环有三个职责清楚的节点：上下文、模型、工具。
 
 ```text
-START ──> [model] ──有 tool_calls──> [tools] ──没转够──> [model]
-             │                          │
-             │ 没有 tool_calls          │ 转够轮数或发现连续重复
-             v                          v
-            END                        END
+START ──> [context] ──> [model] ──有 tool_calls──> [tools]
+              ▲              │                         │
+              │              │ 无 tool_calls            │ 可继续
+              │              ▼                         │
+              │             END                        │
+              └────────────────────────────────────────┘
+工具侧触发保险丝或不可重试错误 ──> END
 ```
+
+`context` 只在估算输入接近预算时调用模型更新旧摘要；正常短对话不额外调用模型。
+摘要调用失败或返回空内容时保留旧摘要，继续本轮回答。
+工具的单条长结果在写入 `ToolMessage` 前截断并明确标记。SQLite checkpoint
+保留全部对话消息（工具结果只保留限长后的版本）；发给模型的则是“旧摘要＋近期原文＋当前任务”。
+预算常量集中在 `app/context.py`：策略上限为约 200000 token 触发、压到约 100000 token；
+实际触发值取策略上限与 `.env` 中 `LLM_MAX_INPUT_TOKENS` 的 80% 中较小者；
+目标值不超过实际触发值的一半。换模型时须同步修改窗口配置。
+单条工具结果最多保留 4000 字符。这是保守估算，不是模型厂商的精确 token 计数。
 
 **两条结束路径的含义完全不同，这是整个项目最值得讲的一点：**
 
@@ -95,7 +107,8 @@ common_agent/
 │  ├─ mcp_bridge.py          # MCP 动态发现到 LangChain 工具的桥
 │  ├─ tool_registry.py       # 工具契约、来源和权限登记表
 │  ├─ tool_errors.py         # 可重试/不可重试的工具失败约定
-│  ├─ manual_loop.py         # 手写主循环：两个节点 + 两条条件边（唯一引擎）
+│  ├─ context.py             # token 粗估、摘要切点和单条工具结果限长
+│  ├─ manual_loop.py         # 手写上下文/模型/工具循环（唯一引擎）
 │  ├─ agent.py               # 模型 + 三类工具 + 组装图
 │  ├─ display.py             # 把执行轨迹显示给人
 │  └─ cli.py                 # 异步多轮命令行产品入口
