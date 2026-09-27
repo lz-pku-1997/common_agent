@@ -47,6 +47,7 @@ def create_chat_model() -> ChatOpenAI:
         temperature=0,
         timeout=60,
         max_retries=2,
+        profile={"max_input_tokens": settings["max_input_tokens"]},
     )
 
 

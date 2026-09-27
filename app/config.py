@@ -35,13 +35,14 @@ def require_environment_variable(name: str) -> str:
     return value
 
 
-def load_model_settings() -> dict[str, str]:
-    """返回创建模型所需的三项配置，但不打印密钥。"""
+def load_model_settings() -> dict[str, str | int]:
+    """返回创建模型所需的配置，但不打印密钥。"""
 
     return {
         "api_key": require_environment_variable("LLM_API_KEY"),
         "base_url": require_environment_variable("LLM_BASE_URL"),
         "model": require_environment_variable("LLM_MODEL"),
+        "max_input_tokens": int(require_environment_variable("LLM_MAX_INPUT_TOKENS")),
     }
 
 
