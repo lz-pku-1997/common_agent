@@ -23,6 +23,9 @@ DATA_DIR = PROJECT_ROOT / "data"
 DATABASE_PATH = DATA_DIR / "agent.sqlite"
 KNOWLEDGE_DATABASE_PATH = DATA_DIR / "knowledge.sqlite"
 
+# 文件读取和工具入口共用这条字符预算，避免一页读完又被入口截断。
+MAX_TOOL_RESULT_CHARS = 20000
+
 
 def require_environment_variable(name: str) -> str:
     """读取一个必填环境变量；没有配置就给出能看懂的错误。"""

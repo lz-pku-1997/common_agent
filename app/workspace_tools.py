@@ -9,7 +9,7 @@ from pathlib import Path
 
 from langchain.tools import tool
 
-from app.config import WORKSPACE_ROOT
+from app.config import MAX_TOOL_RESULT_CHARS, WORKSPACE_ROOT
 from app.tool_errors import NonRetryableError, RetryableError
 
 
@@ -17,6 +17,8 @@ ALLOWED_TEXT_SUFFIXES = {".md", ".txt", ".json", ".csv", ".py"}
 MAX_READ_BYTES = 1_000_000
 MAX_WRITE_CHARACTERS = 100_000
 MAX_SEARCH_RESULTS = 50
+MAX_READ_LINE_CHARS = 5000
+MAX_SEARCH_LINE_CHARS = 500
 
 
 def resolve_workspace_path(relative_path: str) -> Path:
@@ -75,8 +77,19 @@ def list_workspace_files(relative_directory: str = ".") -> str:
 
 
 @tool
-def read_text_file(relative_path: str) -> str:
-    """读取 workspace 中一个 UTF-8 文本文件。支持 md、txt、json、csv 和 py，最大 1 MB。"""
+def read_text_file(relative_path: str, start_line: int = 1, max_lines: int | None = None) -> str:
+    """按行读取 workspace 的 UTF-8 文本，支持 md/txt/json/csv/py。
+
+    start_line 从 1 开始，max_lines 不填时最多读 2000 行。
+    单行正文最多展示 5000 字符，超长补 ...；整页含行号和提示不超过 20000 字符。
+    返回下一页起点或文件结束提示；超长行被省略的部分不会在下一页续读。
+    """
+
+    if start_line < 1:
+        raise RetryableError("start_line 必须从 1 开始。")
+    if max_lines is not None and max_lines < 1:
+        raise RetryableError("max_lines 必须大于 0。")
+    page_size = 2000 if max_lines is None else max_lines
 
     path = resolve_workspace_path(relative_path)
     if not path.exists():
@@ -84,50 +97,77 @@ def read_text_file(relative_path: str) -> str:
     if not path.is_file():
         raise RetryableError(f"这不是文件：{relative_path}")
     ensure_supported_text_file(path)
-    if path.stat().st_size > MAX_READ_BYTES:
-        raise RetryableError("文件超过 1 MB。内核版拒绝一次性读取，以免撑爆模型上下文。")
-
-    # utf-8-sig 既能读取普通 UTF-8，也能自动去掉某些 Windows 文件开头的 BOM 标记。
-    return path.read_text(encoding="utf-8-sig")
+    # 先流式数行，再流式取本页。多扫一遍是为了准确报告总行数，不把整份文件装进列表。
+    with path.open(encoding="utf-8-sig", newline="") as file:
+        total_lines = sum(1 for _ in file)
+        if total_lines == 0:
+            return "[文件结束，共 0 行。]"
+        if start_line > total_lines:
+            raise RetryableError(f"start_line 超出文件末尾，文件共 {total_lines} 行。")
+        file.seek(0)  # 上面数行数已把文件读到末尾，游标拨回开头才能重新逐行取本页
+        lines: list[str] = []
+        used_chars = 0
+        footer = ""
+        for line_number, line in enumerate(file, start=1):
+            if line_number < start_line:
+                continue
+            if len(lines) >= page_size:
+                break
+            text = line.rstrip("\r\n")
+            if len(text) > MAX_READ_LINE_CHARS:
+                text = text[:MAX_READ_LINE_CHARS] + "..."
+            rendered = f"{line_number}: {text}"
+            next_footer = f"[已显示第 {start_line}–{line_number} 行 / 共 {total_lines} 行；"
+            if line_number == total_lines:
+                next_footer += f"文件结束，共 {total_lines} 行。]"
+            else:
+                next_footer += f"下次 start_line={line_number + 1}。]"
+            # 行号、换行和页尾提示也算进预算；装不下的整行留给下一页。
+            if used_chars + len(rendered) + 1 + len(next_footer) > MAX_TOOL_RESULT_CHARS:
+                break
+            lines.append(rendered)
+            used_chars += len(rendered) + 1
+            footer = next_footer
+    return "\n".join([*lines, footer])
 
 
 @tool
 def search_workspace_text(query: str, file_pattern: str = "*.md") -> str:
-    """在 workspace 的文本文件中搜索文字。query 是关键词，file_pattern 例如 '*.md' 或 '*.py'。"""
+    """在 workspace 中搜索；支持单个文件路径或通配表达式。"""
 
     keyword = query.strip()
     if not keyword:
         raise RetryableError("搜索词不能为空。")
 
-    # 只接受“*.扩展名”，不让模型借 pattern 拼出 workspace 外的路径。
-    if not file_pattern.startswith("*.") or "/" in file_pattern or "\\" in file_pattern:
-        raise RetryableError("file_pattern 只能写成 '*.md'、'*.txt' 这一类形式。")
-
-    suffix = file_pattern[1:].lower()
-    if suffix not in ALLOWED_TEXT_SUFFIXES:
-        raise RetryableError("这个文件类型不在允许搜索的范围内。")
+    # 具体路径只查一次；通配表达式沿用递归搜索，*.txt 仍能匹配子目录。
+    try:
+        paths = (WORKSPACE_ROOT.rglob(file_pattern) if any(char in file_pattern for char in "*?[")
+                 else [WORKSPACE_ROOT / file_pattern])
+    except (NotImplementedError, ValueError, OSError) as error:
+        raise RetryableError("不支持这种路径写法，请写成 '*.md'、'notes/*.md' 或某个文件路径。") from error
 
     matches: list[str] = []
-    for path in sorted(WORKSPACE_ROOT.rglob(file_pattern)):
-        # 扫描结果也可能是指向 workspace 外的符号链接；只读取校验后的真实路径。
+    for path in paths:
+        # 批量扫描中也可能遇到指向 workspace 外的符号链接。
         path = path.resolve()
-        if (
-            not path.is_relative_to(WORKSPACE_ROOT)
-            or not path.is_file()
-            or path.stat().st_size > MAX_READ_BYTES
-        ):
+        if not path.is_relative_to(WORKSPACE_ROOT) or not path.is_file():
             continue
 
-        text = path.read_text(encoding="utf-8-sig", errors="replace")
-        for line_number, line in enumerate(text.splitlines(), start=1):
-            if keyword.casefold() in line.casefold():
+        # 逐行扫描，大文件也能搜索；命中行只显示前 500 字符。
+        with path.open(encoding="utf-8-sig", errors="replace", newline="") as file:
+            for line_number, line in enumerate(file, start=1):
+                if keyword.casefold() not in line.casefold():
+                    continue
                 relative_name = path.relative_to(WORKSPACE_ROOT).as_posix()
-                matches.append(f"{relative_name}:{line_number}: {line.strip()}")
+                snippet = line.strip()
+                if len(snippet) > MAX_SEARCH_LINE_CHARS:
+                    snippet = snippet[:MAX_SEARCH_LINE_CHARS] + "..."
+                matches.append(f"{relative_name}:{line_number}: {snippet}")
                 if len(matches) >= MAX_SEARCH_RESULTS:
                     return "\n".join(matches) + "\n……结果较多，已停止在前 50 条。"
 
     if not matches:
-        return f"没有在 {file_pattern} 文件中找到：{keyword}"
+        return f"没有在 {file_pattern} 中找到：{keyword}"
     return "\n".join(matches)
 
 
