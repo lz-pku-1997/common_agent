@@ -1,10 +1,10 @@
-"""真实向量 RAG：文档切块、Embedding、SQLite 存储、余弦相似度检索。
+"""真实 RAG：向量与关键词双路召回，融合后交给重排模型。
 
 RAG = Retrieval-Augmented Generation，中文常译“检索增强生成”。
 它不是一个单独的大模型，而是一条链路：
 
 文档 -> 切块 -> Embedding 向量 -> 保存
-问题 -> Embedding 向量 -> 找相似块 -> 把证据交给聊天模型回答
+问题 -> 关键词/向量各找候选 -> 合并排名 -> 重排 -> 交给聊天模型回答
 
 为了让学习者看清原理，本项目没有把核心步骤藏进大型向量数据库。向量由百炼真实
 text-embedding-v4 生成，文本和向量真实保存在 SQLite，检索由这里明确计算。
@@ -13,55 +13,66 @@ text-embedding-v4 生成，文本和向量真实保存在 SQLite，检索由这�
 import hashlib
 import json
 import math
+import re
 import sqlite3
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
+import httpx
+import jieba
 from langchain.tools import tool
+from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
-from app.config import KNOWLEDGE_DATABASE_PATH, WORKSPACE_ROOT, load_embedding_settings
+from app.config import (
+    KNOWLEDGE_DATABASE_PATH,
+    WORKSPACE_ROOT,
+    load_embedding_settings,
+    require_environment_variable,
+    resolve_credential,
+)
 from app.tool_errors import RetryableError
 from app.workspace_tools import MAX_READ_BYTES, resolve_workspace_path
 
 
 RAG_FILE_SUFFIXES = {".md", ".txt", ".json", ".csv"}
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 120
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 64
+RRF_K = 60
 
 
-def split_text(text: str) -> list[str]:
-    """把长文切成约 800 字、相邻重复约 120 字的小块。
+def search_terms(text: str) -> list[str]:
+    """中英混排先分词；标点不是词，避免把 FTS 查询语法当作用户输入。"""
 
-    为什么要 overlap（重叠）？如果一句话恰好横跨两个块，没有重叠就可能两边都不完整。
-    重复一点边界文字，可以提高检索到完整语义的概率。
-    """
+    return [part for word in jieba.cut(text) for part in re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+", word)]
 
-    cleaned_text = text.strip()
-    if not cleaned_text:
+
+def split_text(text: str, is_markdown: bool = True) -> list[str]:
+    """Markdown 先按标题分节，再按段落、句子递归切块；普通文本只做递归切块。"""
+
+    if not text.strip():
         return []
 
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", "。", "！", "？", "；", " ", ""],
+        keep_separator="end",
+    )
+    if is_markdown:
+        headers = [("#" * level, f"h{level}") for level in range(1, 7)]
+        sections = MarkdownHeaderTextSplitter(headers_to_split_on=headers).split_text(text)
+    else:
+        sections = [Document(page_content=text)]
+
     chunks: list[str] = []
-    start = 0
-    while start < len(cleaned_text):
-        end = min(start + CHUNK_SIZE, len(cleaned_text))
-
-        # 如果还没到文章结尾，优先在后半段的换行处切开，少切断一个自然段。
-        if end < len(cleaned_text):
-            newline_position = cleaned_text.rfind("\n", start + CHUNK_SIZE // 2, end)
-            if newline_position != -1:
-                end = newline_position
-
-        chunk = cleaned_text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-
-        if end >= len(cleaned_text):
-            break
-
-        next_start = end - CHUNK_OVERLAP
-        # 保险丝：无论文本长什么样，start 都必须向前移动，避免 while 死循环。
-        start = next_start if next_start > start else end
+    for section in sections:
+        # 标题路径是现成的上下文，让独立的块也知道自己属于哪一节。
+        heading = " > ".join(section.metadata.values())
+        for body in splitter.split_text(section.page_content):
+            chunks.append(f"{heading}\n\n{body}" if heading else body)
 
     return chunks
 
@@ -97,7 +108,12 @@ def create_embeddings() -> OpenAIEmbeddings:
 
 
 def prepare_knowledge_database(connection: sqlite3.Connection) -> None:
-    """创建 RAG 所需的两张表；已有表不会被清空。"""
+    """为测试知识库创建 RAG 表；切块或分词规则变化时直接重建测试库。
+
+    注意：内容哈希只取决于文件原文，因此改了切块规则（split_text）或分词规则
+    （search_terms）之后，索引不会自动失效，必须删掉 data/knowledge.sqlite 重建，
+    否则会看到"跳过 N 个未变化文件"而实际一条都没更新。
+    """
 
     connection.execute(
         """
@@ -119,6 +135,9 @@ def prepare_knowledge_database(connection: sqlite3.Connection) -> None:
             PRIMARY KEY (path, chunk_index)
         )
         """
+    )
+    connection.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunks_fts USING fts5(path UNINDEXED, chunk_index UNINDEXED, content)"
     )
 
 
@@ -148,20 +167,37 @@ def index_knowledge_base(relative_directory: str = ".") -> str:
         raise RetryableError(f"知识目录不存在或不是目录：{relative_directory}")
 
     files = find_indexable_files(directory)
-    if not files:
+    if not files and not KNOWLEDGE_DATABASE_PATH.exists():
         return "没有找到可以建立知识索引的文本文件。"
 
-    embedding_settings = load_embedding_settings()
-    embedding_model = str(embedding_settings["model"])
-    embeddings = create_embeddings()
+    embedding_model = str(load_embedding_settings()["model"]) if files else None
+    embeddings = create_embeddings() if files else None
     KNOWLEDGE_DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     indexed_files = 0
     indexed_chunks = 0
     unchanged_files = 0
+    removed_files = 0
 
-    with sqlite3.connect(KNOWLEDGE_DATABASE_PATH) as connection:
+    # sqlite3 的 with 只负责提交/回滚；closing 另外负责关闭连接，避免 Windows 锁住数据库。
+    with closing(sqlite3.connect(KNOWLEDGE_DATABASE_PATH)) as connection, connection:
         prepare_knowledge_database(connection)
+
+        # 只同步本次索引的目录；索引 knowledge/ 不会清掉 notes/ 的记录。
+        scope = directory.relative_to(WORKSPACE_ROOT).as_posix()
+        current_paths = {path.relative_to(WORKSPACE_ROOT).as_posix() for path in files}
+        stored_paths = connection.execute(
+            "SELECT path FROM rag_documents UNION SELECT path FROM rag_chunks UNION SELECT path FROM rag_chunks_fts"
+        ).fetchall()
+        for (stored_path,) in stored_paths:
+            if (scope == "." or stored_path.startswith(scope + "/")) and stored_path not in current_paths:
+                connection.execute("DELETE FROM rag_documents WHERE path = ?", (stored_path,))
+                connection.execute("DELETE FROM rag_chunks WHERE path = ?", (stored_path,))
+                connection.execute("DELETE FROM rag_chunks_fts WHERE path = ?", (stored_path,))
+                removed_files += 1
+
+        if not files:
+            return f"目录里没有可索引文件；清理 {removed_files} 个已删除文件。"
 
         for path in files:
             content = path.read_text(encoding="utf-8-sig", errors="replace")
@@ -176,7 +212,7 @@ def index_knowledge_base(relative_directory: str = ".") -> str:
                 unchanged_files += 1
                 continue
 
-            chunks = split_text(content)
+            chunks = split_text(content, is_markdown=path.suffix.lower() == ".md")
             if not chunks:
                 continue
 
@@ -184,6 +220,7 @@ def index_knowledge_base(relative_directory: str = ".") -> str:
             vectors = embeddings.embed_documents(chunks)
 
             connection.execute("DELETE FROM rag_chunks WHERE path = ?", (relative_path,))
+            connection.execute("DELETE FROM rag_chunks_fts WHERE path = ?", (relative_path,))
             for chunk_index, (chunk, vector) in enumerate(zip(chunks, vectors)):
                 connection.execute(
                     """
@@ -191,6 +228,10 @@ def index_knowledge_base(relative_directory: str = ".") -> str:
                     VALUES (?, ?, ?, ?)
                     """,
                     (relative_path, chunk_index, chunk, json.dumps(vector)),
+                )
+                connection.execute(
+                    "INSERT INTO rag_chunks_fts(path, chunk_index, content) VALUES (?, ?, ?)",
+                    (relative_path, chunk_index, " ".join(search_terms(chunk))),
                 )
 
             connection.execute(
@@ -214,13 +255,14 @@ def index_knowledge_base(relative_directory: str = ".") -> str:
 
     return (
         f"知识索引完成：新增或更新 {indexed_files} 个文件、{indexed_chunks} 个文本块；"
-        f"跳过 {unchanged_files} 个未变化文件。向量模型：{embedding_model}。"
+        f"跳过 {unchanged_files} 个未变化文件；清理 {removed_files} 个已删除文件。"
+        f"向量模型：{embedding_model}。"
     )
 
 
 @tool
 def search_knowledge_base(query: str, top_k: int = 4) -> str:
-    """对已建立索引的 workspace 知识做语义检索，返回最相关原文、来源和相似度；top_k 为 1 到 8。"""
+    """关键词与向量各召回候选，RRF 融合，再用真实重排模型选证据；top_k 为 1 到 8。"""
 
     question = query.strip()
     if not question:
@@ -231,8 +273,23 @@ def search_knowledge_base(query: str, top_k: int = 4) -> str:
         return "知识库尚未建立。请先调用 index_knowledge_base。"
 
     embedding_model = str(load_embedding_settings()["model"])
-    with sqlite3.connect(KNOWLEDGE_DATABASE_PATH) as connection:
+    candidate_limit = max(top_k * 4, 8)
+    with closing(sqlite3.connect(KNOWLEDGE_DATABASE_PATH)) as connection, connection:
         prepare_knowledge_database(connection)
+        # 入库和查询用同一套中文分词；FTS5 的 bm25() 统一给中英文关键词排序。
+        keyword_query = " OR ".join(f'"{word}"' for word in dict.fromkeys(search_terms(question)))
+        keyword_rows = connection.execute(
+            """
+            SELECT c.path, c.chunk_index, c.content
+            FROM rag_chunks_fts AS f
+            JOIN rag_chunks AS c ON c.path = f.path AND c.chunk_index = f.chunk_index
+            JOIN rag_documents AS d ON d.path = f.path
+            WHERE rag_chunks_fts MATCH ? AND d.embedding_model = ?
+            ORDER BY bm25(rag_chunks_fts)
+            LIMIT ?
+            """,
+            (keyword_query, embedding_model, candidate_limit),
+        ).fetchall() if keyword_query else []
         rows = connection.execute(
             """
             SELECT c.path, c.chunk_index, c.content, c.embedding_json
@@ -255,12 +312,54 @@ def search_knowledge_base(query: str, top_k: int = 4) -> str:
 
     scored_chunks.sort(key=lambda item: item[0], reverse=True)
 
+    # 同一 chunk 可能被两路都找出；按 (路径, 块号) 去重，两个名次共同加分。
+    fused: dict[tuple[str, int], dict] = {}
+    for rank, (path, chunk_index, content) in enumerate(keyword_rows, start=1):
+        fused[(path, chunk_index)] = {
+            "path": path, "chunk_index": chunk_index,
+            "content": content, "rrf": 1 / (RRF_K + rank),
+        }
+    for rank, (_, path, chunk_index, content) in enumerate(scored_chunks[:candidate_limit], start=1):
+        key = (path, chunk_index)
+        if key in fused:
+            fused[key]["rrf"] += 1 / (RRF_K + rank)
+        else:
+            fused[key] = {
+                "path": path, "chunk_index": chunk_index,
+                "content": content, "rrf": 1 / (RRF_K + rank),
+            }
+    candidates = sorted(fused.values(), key=lambda item: item["rrf"], reverse=True)[:candidate_limit]
+
+    # 重排会产生额外调用；接口地址从配置读取，不在代码中写死。
+    try:
+        response = httpx.post(
+            require_environment_variable("RERANK_API_URL"),
+            headers={"Authorization": f"Bearer {resolve_credential('RERANK_API_KEY', 'LLM_API_KEY')}"},
+            json={"model": "qwen3-rerank", "query": question,
+                  "documents": [item["content"] for item in candidates], "top_n": top_k},
+            timeout=30,
+        )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        # 网络或接口故障时证据仍可用，但必须明说这次只按 RRF 排序。
+        return "\n\n".join(
+            f"[证据 {rank}] source={item['path']}#chunk-{item['chunk_index']} "
+            f"ranking=RRF_only（重排失败）\n{item['content']}"
+            for rank, item in enumerate(candidates[:top_k], start=1)
+        )
+    results = response.json().get("results")
+    if not isinstance(results, list) or not results:
+        raise RuntimeError("重排接口未返回有效结果；本次检索没有冒充已完成重排。")
+
     evidence_blocks: list[str] = []
-    for rank, (score, path, chunk_index, content) in enumerate(
-        scored_chunks[:top_k], start=1
-    ):
+    for rank, result in enumerate(results[:top_k], start=1):
+        index = result.get("index")
+        if not isinstance(index, int) or not 0 <= index < len(candidates):
+            raise RuntimeError("重排接口返回了无效候选编号。")
+        item = candidates[index]
         evidence_blocks.append(
-            f"[证据 {rank}] source={path}#chunk-{chunk_index} score={score:.4f}\n{content}"
+            f"[证据 {rank}] source={item['path']}#chunk-{item['chunk_index']} "
+            f"rerank_score={result['relevance_score']:.4f}\n{item['content']}"
         )
     return "\n\n".join(evidence_blocks)
 

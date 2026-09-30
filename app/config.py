@@ -38,6 +38,16 @@ def require_environment_variable(name: str) -> str:
     return value
 
 
+def resolve_credential(name: str, fallback: str) -> str:
+    """读取一个专用配置；没有配置时回落到通用配置。
+
+    为什么要回落：对话可以走套餐专用端点，但套餐不提供 Embedding 与重排，
+    这两项仍然走通用端点，而两套端点的地址和密钥不同。
+    """
+
+    return os.getenv(name, "").strip() or require_environment_variable(fallback)
+
+
 def load_model_settings() -> dict[str, str | int]:
     """返回创建模型所需的配置，但不打印密钥。"""
 
@@ -54,6 +64,9 @@ def load_embedding_settings() -> dict[str, str | int]:
 
     Embedding 与聊天模型用途不同：聊天模型生成文字，Embedding 模型把文字变成向量。
     没有在 .env 中显式配置时，使用百炼当前推荐的 text-embedding-v4 与 1024 维。
+
+    地址与密钥优先读 EMBEDDING_BASE_URL / EMBEDDING_API_KEY，没配才回落到对话那套，
+    因为套餐端点只提供对话模型，向量必须走通用端点。
     """
 
     dimensions_text = os.getenv("EMBEDDING_DIMENSIONS", "1024").strip()
@@ -63,8 +76,8 @@ def load_embedding_settings() -> dict[str, str | int]:
         raise RuntimeError("EMBEDDING_DIMENSIONS 必须是整数。") from error
 
     return {
-        "api_key": require_environment_variable("LLM_API_KEY"),
-        "base_url": require_environment_variable("LLM_BASE_URL"),
+        "api_key": resolve_credential("EMBEDDING_API_KEY", "LLM_API_KEY"),
+        "base_url": resolve_credential("EMBEDDING_BASE_URL", "LLM_BASE_URL"),
         "model": os.getenv("EMBEDDING_MODEL", "text-embedding-v4").strip(),
         "dimensions": dimensions,
     }

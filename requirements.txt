@@ -5,6 +5,9 @@ langchain-openai==1.6.2
 langgraph==1.2.11
 langgraph-checkpoint-sqlite==3.1.1
 python-dotenv==1.2.3
+httpx==0.28.1
+langchain-text-splitters==1.1.2
+jieba==0.42.1
 
 # 官方 MCP Python SDK。当前 LangChain MCP 适配器 0.3.2 仍要求 mcp<2，
 # 因此本项目直接使用最新官方 SDK 2.2.0，避免为了适配器退回旧协议实现。
