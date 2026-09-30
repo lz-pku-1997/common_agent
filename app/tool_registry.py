@@ -60,24 +60,6 @@ class ToolRegistry:
             raise ValueError(f"不支持的权限模式：{policy.permission}")
         self._entries[tool.name] = RegisteredTool(tool=tool, policy=policy)
 
-    def register_many(
-        self,
-        tools: list[BaseTool],
-        *,
-        source: str,
-        permission: PermissionMode,
-    ) -> None:
-        """用同一组默认策略登记一批同来源工具。"""
-
-        for tool in tools:
-            self.register(
-                tool,
-                ToolPolicy(
-                    source=source,
-                    permission=permission,
-                ),
-            )
-
     def tools_for_model(self) -> list[BaseTool]:
         """返回允许暴露给模型的工具。
 
@@ -116,47 +98,37 @@ def build_tool_registry(
     rag_tools: list[BaseTool],
     mcp_tools: list[BaseTool],
 ) -> ToolRegistry:
-    """按工具来源建立 common_agent 的第一版治理登记表。"""
+    """按来源和工具名定权限；未配置的新工具必须先获得人工确认。"""
 
     registry = ToolRegistry()
+    # 只给明确列出的只读工具自动执行权限。按来源分表，避免外部 MCP 工具
+    # 仅凭与本地工具同名就拿到本地权限；路径和参数校验仍由 handler 负责。
+    permissions_by_source = {
+        "workspace": {
+            "list_workspace_files": "allow",
+            "read_text_file": "allow",
+            "search_workspace_text": "allow",
+            "save_new_text_file": "ask",  # 新建文件会真实写盘。
+        },
+        "rag": {
+            "search_knowledge_base": "allow",
+            "index_knowledge_base": "ask",  # 写数据库并消耗 Embedding 额度。
+        },
+        "mcp": {
+            "add_numbers": "allow",
+            "get_current_time": "allow",
+        },
+    }
 
-    # workspace 读工具可以自动执行，但路径和文件类型仍由工具函数校验。
-    workspace_read_tools = [
-        tool for tool in workspace_tools if tool.name != "save_new_text_file"
-    ]
-    registry.register_many(
-        workspace_read_tools,
-        source="workspace",
-        permission="allow",
-    )
-
-    # 写文件会产生持久副作用，因此登记为 ask；执行前会触发 HITL 确认。
-    workspace_write_tools = [
-        tool for tool in workspace_tools if tool.name == "save_new_text_file"
-    ]
-    registry.register_many(
-        workspace_write_tools,
-        source="workspace",
-        permission="ask",
-    )
-
-    # 建索引会写 SQLite 并消耗 Embedding 额度，因此属于 ask；纯检索是 allow。
-    for tool in rag_tools:
-        is_indexing = tool.name == "index_knowledge_base"
-        registry.register(
-            tool,
-            ToolPolicy(
-                source="rag",
-                permission="ask" if is_indexing else "allow",
-            ),
-        )
-
-    # MCP 工具来自外部 Server，先统一标记来源和外部风险；具体工具的细分策略
-    # 后续可以在发现 Schema 后按工具名覆盖，而不需要改变 MCP 桥接代码。
-    registry.register_many(
-        mcp_tools,
-        source="mcp",
-        permission="allow",
-    )
+    for source, tools in (
+        ("workspace", workspace_tools),
+        ("rag", rag_tools),
+        ("mcp", mcp_tools),
+    ):
+        for tool in tools:
+            # 新工具仍进入模型说明书，但执行前走已有 HITL 确认。
+            # 要明确禁止某个工具，在上面的表中将其配置为 deny 即可。
+            permission = permissions_by_source[source].get(tool.name, "ask")
+            registry.register(tool, ToolPolicy(source=source, permission=permission))
 
     return registry
