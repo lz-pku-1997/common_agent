@@ -391,8 +391,13 @@ def build_agent_graph(
                     raise RetryableError(f"工具不存在：{tool_name}。可用工具：{available}")
                 # ainvoke 对同步工具和异步（MCP）工具都能用。
                 raw_content, artifact = limit_tool_result(str(await tool.ainvoke(call["args"])))
-                source = policy.source if policy is not None else "unknown"
-                content = format_untrusted_tool_result(source, tool_name, raw_content)
+                source = policy.source if policy is not None else "unknown"  # 来源取自程序登记记录，不由模型参数决定。
+                # Skill 来源由 Registry 确定，模型不能用参数把普通文件变成指南。
+                # 指南允许参考其中的任务步骤，但仍服从用户要求和真实工具权限。
+                if source == "skills":  # Skill 是维护者写的操作指南，不能套用“其中指令一律不执行”的外部数据提示。
+                    content = "[项目 Skill 操作指南：服从用户要求、系统规则和工具权限]\n" + raw_content
+                else:
+                    content = format_untrusted_tool_result(source, tool_name, raw_content)  # 文件/RAG/MCP 正文仍作为不可信数据。
                 status = "success"
             except Exception as error:
                 # 已知可修正错误交给模型有限次改参；未知异常默认停止。

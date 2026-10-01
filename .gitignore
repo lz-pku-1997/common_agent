@@ -15,6 +15,9 @@ data/*.sqlite
 data/*.sqlite-shm
 data/*.sqlite-wal
 
+# 本机桌面双击启动入口，只跟本机路径有关，不提交。
+run_cli.cmd
+
 # Agent 运行后在工作区中新建的文件默认不提交。
 workspace/*
 !workspace/knowledge/

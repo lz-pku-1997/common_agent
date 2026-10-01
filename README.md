@@ -6,11 +6,13 @@
 - 真实工具循环：模型自己选择工具，工具真的读取或新建本地文件，再把结果交还模型。
 - 工具治理登记：按来源和工具名明确配置 allow/ask/deny 权限；未配置的新工具默认 ask，模型可发现，执行前必须人工确认。
 - 工具数据隔离：workspace、RAG、MCP 的真实返回统一标记为不可信数据，不能获得指令权限。
+- 文件化运行规则：启动时读取 `prompts/AGENTS.md`，编辑规则无需修改 Python，重启后生效。
+- Skill 渐进式加载：系统提示只带名称和用途，`skill_view(name)` 按需读取项目维护的任务指南，仍受用户要求和工具权限约束。
 - 真实 RAG：文档切块与向量入库；SQLite 关键词检索和向量检索双路召回，RRF 融合后由百炼 `qwen3-rerank` 重排，返回原文与 source。
 - 真实 MCP：官方 MCP Python SDK 2.2.0；Client 通过 stdio 启动独立 Server，动态发现 Schema 并调用工具。
 - 真实持久化：LangGraph checkpoint 写入 SQLite，同一 `thread_id` 重启后仍能续聊。
 - 上下文预算：工具单条结果限长；历史接近预算时滚动摘要旧消息，原始 checkpoint 仍保留。
-- 真实安全边界：工具只能访问本项目 `workspace`，不能用 `../` 逃出去，不能覆盖文件。
+- 真实安全边界：普通文件工具只能访问 `workspace`；Skill 工具只能只读已登记的项目指南，不能覆盖文件或读取任意路径。
 - 真实交互入口：既能在 PyCharm 运行，也能在 PowerShell 连续聊天。
 - 真实交互链路：可以直接体验“模型 → 工具 → 模型”和 SQLite 会话续聊。
 
@@ -108,11 +110,60 @@ MCP Server 正常返回的工具错误也属于有限改参重试；连接中断
 - [官方 MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
 - [百炼文本向量模型](https://help.aliyun.com/zh/model-studio/embedding)
 
+### 2.1 运行规则与 Skill
+
+`prompts/AGENTS.md` 是 common_agent 运行时的行为规则，由 `app/agent.py` 在启动时读取。
+它不属于仓库根目录给开发助手看的 `AGENTS.md`，也不保存用户长期记忆。
+
+Skill 是一个任务操作指南，放在 `skills/<名称>/SKILL.md`。启动时读取的只有文件头：
+
+```markdown
+---
+name: workspace-note
+description: 用户要求根据 workspace 中的文件整理摘要、复习笔记或新建笔记时使用
+---
+
+这里才是详细步骤，模型调用 skill_view 后才会看到。
+```
+
+当前格式只支持 `name`、`description` 两个单行无引号字段，不支持多行 YAML、嵌套数据或其他字段。
+`name` 与父目录同名，使用小写字母、数字和单个短横线，最长 64 字符；用途最长 1024 字符。
+完整 Skill 文件不超过 20000 字符，确保指南一次读完整。超出时应由维护者缩短。
+没有 Skill 目录或目录为空时，正常运行，只是不提供 `skill_view` 工具。
+
+```text
+启动：运行规则 + 所有 Skill 的名称和用途 → 模型
+任务相关：模型 → skill_view(name) → 完整步骤 → 现有工具 → 回答
+```
+
+清单通过普通字符串拼接加入系统提示；正文由只读工具返回，随后留在现有消息历史中，
+继续使用现有 checkpoint 和摘要机制。新增正文仍会占上下文，节省的是未选中 Skill 的正文。
+这版不自动执行 Skill 中的脚本，也不加载附属资源目录；步骤必须依靠当前已有工具完成。
+
+项目 Skill 由维护者编辑，Agent 的 workspace 写工具不能修改它。`skill_view` 只接收清单中的名称，
+按登记路径读取，拒绝目录外的符号链接。它按 `skills` 来源登记为 `allow`；同名外部 MCP 工具不会继承权限。
+普通工具结果仍标为不可信数据；Skill 返回明确标为操作指南，不能覆盖用户要求、运行规则或实际权限。
+Skill 即使要求写文件，也必须经过原有 HITL 审批。请只放入自己审阅过的项目指南。
+新增或修改元数据、运行规则后需要重启；Skill 正文在调用时读取。
+
+可以这样体验（先用实际文件名替换示例路径）：
+
+```text
+请按 workspace-note 技能，把 knowledge/某份资料.md 整理成复习笔记，先只给我看，不保存。
+```
+
+应先看到 `skill_view`，再看到资料读取工具。明确要求保存时，还应看到人工确认；拒绝后不会写入。
+另一份示例是 `knowledge-answer`，用于根据知识库资料回答并保留来源。
+
 ## 3. 文件结构与阅读顺序
 
 ```text
 common_agent/
 ├─ run_cli.py                 # PyCharm 从这里启动
+├─ prompts/AGENTS.md          # common_agent 的运行规则，启动时加载
+├─ skills/
+│  ├─ workspace-note/SKILL.md # 工作区资料整理为笔记
+│  └─ knowledge-answer/SKILL.md # 知识库检索与来源引用
 ├─ app/
 │  ├─ config.py              # 路径、.env、模型配置
 │  ├─ workspace_tools.py     # 四个真实工具与安全边界
@@ -120,9 +171,10 @@ common_agent/
 │  ├─ mcp_bridge.py          # MCP 动态发现到 LangChain 工具的桥
 │  ├─ tool_registry.py       # 工具契约、来源和权限登记表
 │  ├─ tool_errors.py         # 可重试/不可重试的工具失败约定
+│  ├─ skills.py              # Skill 目录发现、元数据与按名称读取
 │  ├─ context.py             # token 粗估、摘要切点和单条工具结果限长
 │  ├─ manual_loop.py         # 手写上下文/模型/工具循环（唯一引擎）
-│  ├─ agent.py               # 模型 + 三类工具 + 组装图
+│  ├─ agent.py               # 运行规则 + Skill 清单 + 模型/工具组装
 │  ├─ display.py             # 把执行轨迹显示给人
 │  └─ cli.py                 # 异步多轮命令行产品入口
 ├─ mcp_servers/
@@ -143,7 +195,7 @@ common_agent/
 1. `config.py` → `workspace_tools.py`：先复习配置和普通工具。
 2. `rag_tools.py`：看清完整 RAG 数据链路。
 3. `common_tools_server.py` → `mcp_bridge.py`：看清 MCP 的两个进程。
-4. `tool_registry.py` → `agent.py`：理解工具如何登记、筛选后汇入同一个 Agent。
+4. `skills.py` → `tool_registry.py` → `agent.py`：理解规则、Skill 清单和工具如何汇入同一个 Agent。
 5. `cli.py`：理解外层如何启动和持续运行会话。
 
 ## 4. 第一次安装
@@ -239,9 +291,9 @@ PowerShell：
 ## 8. 当前安全边界
 
 - 只允许 `.md`、`.txt`、`.json`、`.csv`、`.py` 文本文件。
-- 单个读取文件最大 1 MB，单次写入最大 10 万字符。
+- 普通文件读取按页限长，单次写入最大 10 万字符；完整 Skill 文件最多 20000 字符。
 - 搜索最多返回 50 条，列目录最多展示 200 项，防止上下文无限膨胀。
-- 只允许 workspace 内路径。
+- 普通文件工具只允许 workspace 内路径；skill_view 只能读取已登记、解析后仍在 skills 目录内的 SKILL.md。
 - 只能新建，不能覆盖、删除或运行 shell 命令。
 - RAG 索引只读取 workspace 中大小合规的 md/txt/json/csv；检索结果被当作不可信证据，不当作系统指令。
 - MCP Server 不接收 `.env` 或 API Key，只暴露显式注册的两个工具；stdio 生命周期由 Client 管理。

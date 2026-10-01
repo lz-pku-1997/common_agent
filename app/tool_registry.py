@@ -97,6 +97,7 @@ def build_tool_registry(
     workspace_tools: list[BaseTool],
     rag_tools: list[BaseTool],
     mcp_tools: list[BaseTool],
+    skill_tools: list[BaseTool] | None = None,  # 可选参数，保留旧调用方不传 Skill 工具时的兼容性。
 ) -> ToolRegistry:
     """按来源和工具名定权限；未配置的新工具必须先获得人工确认。"""
 
@@ -118,17 +119,21 @@ def build_tool_registry(
             "add_numbers": "allow",
             "get_current_time": "allow",
         },
+        "skills": {
+            "skill_view": "allow",  # 只读登记过的指南；allow 不会赋予指南里的操作额外权限。
+        },
     }
 
     for source, tools in (
         ("workspace", workspace_tools),
         ("rag", rag_tools),
         ("mcp", mcp_tools),
+        ("skills", skill_tools or []),  # None 转为空列表，统一走下面同一套登记循环。
     ):
         for tool in tools:
             # 新工具仍进入模型说明书，但执行前走已有 HITL 确认。
             # 要明确禁止某个工具，在上面的表中将其配置为 deny 即可。
-            permission = permissions_by_source[source].get(tool.name, "ask")
+            permission = permissions_by_source[source].get(tool.name, "ask")  # 新工具没列入白名单时默认 ask。
             registry.register(tool, ToolPolicy(source=source, permission=permission))
 
     return registry
