@@ -90,7 +90,7 @@ async def main_async() -> None:
     print("=" * 62)
     print("common_agent v1.0：真实模型 + 文件工具 + 向量 RAG + MCP + SQLite")
     print(f"当前模型：{settings['model']}")
-    print("安全边界：工具只能访问本项目的 workspace，且不能覆盖已有文件。")
+    print("安全边界：普通文件工具限定 workspace；记忆工具限定 memory，写入和更新需批准。")
     print("=" * 62)
 
     raw_thread_id = input("会话编号（直接回车使用 common-demo）：")

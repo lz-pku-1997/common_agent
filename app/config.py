@@ -21,6 +21,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 WORKSPACE_ROOT = (PROJECT_ROOT / "workspace").resolve()
 AGENT_RULES_PATH = PROJECT_ROOT / "prompts" / "AGENTS.md"  # common_agent 启动时读取的运行规则文件。
 SKILLS_ROOT = (PROJECT_ROOT / "skills").resolve()  # Skill 的安全根目录；读取指南时必须留在这里面。
+MEMORY_ROOT = (PROJECT_ROOT / "memory").resolve()  # 产品自己的跨会话记忆，与助手协作的 common_memory 无关。
 DATA_DIR = PROJECT_ROOT / "data"
 DATABASE_PATH = DATA_DIR / "agent.sqlite"
 KNOWLEDGE_DATABASE_PATH = DATA_DIR / "knowledge.sqlite"

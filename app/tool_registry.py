@@ -98,6 +98,7 @@ def build_tool_registry(
     rag_tools: list[BaseTool],
     mcp_tools: list[BaseTool],
     skill_tools: list[BaseTool] | None = None,  # 可选参数，保留旧调用方不传 Skill 工具时的兼容性。
+    memory_tools: list[BaseTool] | None = None,
 ) -> ToolRegistry:
     """按来源和工具名定权限；未配置的新工具必须先获得人工确认。"""
 
@@ -122,6 +123,11 @@ def build_tool_registry(
         "skills": {
             "skill_view": "allow",  # 只读登记过的指南；allow 不会赋予指南里的操作额外权限。
         },
+        "memory": {
+            "memory_read": "allow",
+            "create_memory": "ask",  # 新建和修改都真实写盘，审批参数会展示路径及内容。
+            "update_memory": "ask",
+        },
     }
 
     for source, tools in (
@@ -129,6 +135,7 @@ def build_tool_registry(
         ("rag", rag_tools),
         ("mcp", mcp_tools),
         ("skills", skill_tools or []),  # None 转为空列表，统一走下面同一套登记循环。
+        ("memory", memory_tools or []),
     ):
         for tool in tools:
             # 新工具仍进入模型说明书，但执行前走已有 HITL 确认。

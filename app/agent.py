@@ -9,6 +9,7 @@ from langchain_openai import ChatOpenAI
 from app.config import AGENT_RULES_PATH, load_model_settings
 from app.manual_loop import build_agent_graph
 from app.mcp_bridge import load_mcp_tools
+from app.memory import MEMORY_TOOLS, load_memory_context
 from app.rag_tools import RAG_TOOLS
 from app.skills import build_skill_tools, load_skill_catalog
 from app.tool_registry import build_tool_registry
@@ -35,7 +36,7 @@ def create_chat_model() -> ChatOpenAI:
 
 
 async def build_common_agent(checkpointer):
-    """组装“模型 + 工具循环 + SQLite 记忆”并返回可运行的 Agent。
+    """组装模型、工具循环、SQLite 会话与文件长期记忆，返回可运行的 Agent。
 
     checkpointer 由外层传入，因为 SQLite 连接必须在使用期间保持打开。
     """
@@ -55,7 +56,7 @@ async def build_common_agent(checkpointer):
     # 先登记来源和权限，再把允许暴露的工具交给主循环。
     # LangChain 仍负责 Tool/Schema；Registry 只负责项目自己的治理元数据。
     tool_registry = build_tool_registry(  # 把 Skill 工具和其他来源放进同一权限登记表。
-        WORKSPACE_TOOLS, RAG_TOOLS, mcp_tools, build_skill_tools(catalog)
+        WORKSPACE_TOOLS, RAG_TOOLS, mcp_tools, build_skill_tools(catalog), MEMORY_TOOLS
     )
     model = create_chat_model()
 
@@ -65,4 +66,5 @@ async def build_common_agent(checkpointer):
         tool_registry=tool_registry,
         system_prompt=system_prompt,
         checkpointer=checkpointer,
+        memory_context_loader=load_memory_context,  # 每次请求重读文件，不把长期记忆固化进图或 checkpoint。
     )
