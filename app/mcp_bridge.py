@@ -10,13 +10,26 @@ import sys
 from pathlib import Path
 
 from langchain_core.tools import StructuredTool
+from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 from mcp import Client, StdioServerParameters
+from mcp.shared.exceptions import MCPError
+from mcp_types import CONNECTION_CLOSED, REQUEST_TIMEOUT
 
 from app.config import PROJECT_ROOT
-from app.tool_errors import RetryableError
+from app.tool_errors import FixableError, NonRetryableError, RetryableError
 
 
 MCP_SERVER_PATH = PROJECT_ROOT / "mcp_servers" / "common_tools_server.py"
+SAFE_TO_REPEAT = {"add_numbers", "get_current_time"}  # 本项目 Server 的两个工具无写入副作用；新工具不自动获得重试权限。
+
+
+def is_transport_error(error: Exception) -> bool:
+    """只识别连接关闭和等待超时，不把业务错误、代码错误当成临时故障。"""
+    if isinstance(error, ExceptionGroup):  # SDK 的任务组可能把多个异常包装在一起。
+        return all(is_transport_error(item) for item in error.exceptions)  # 混有未知异常就不自动重试。
+    if isinstance(error, MCPError):
+        return error.code in {CONNECTION_CLOSED, REQUEST_TIMEOUT}  # 其他协议错误不保证重试有效。
+    return isinstance(error, (ConnectionError, TimeoutError, EOFError, BrokenResourceError, ClosedResourceError, EndOfStream))
 
 
 def create_server_parameters() -> StdioServerParameters:
@@ -39,8 +52,8 @@ def mcp_result_to_text(result) -> str:
             if hasattr(block, "text")
         ]
         # Server 正常返回的工具错误常是参数不符；给模型有限次改参机会。
-        # 连接中断等直接抛出的异常不会走这里，仍由主循环安全收口。
-        raise RetryableError("MCP 工具执行失败：" + "\n".join(error_parts))
+        # 连接故障在调用层单独识别；这里不是服务重试入口。
+        raise FixableError("MCP 工具执行失败：" + "\n".join(error_parts))
 
     if result.structured_content is not None:
         return json.dumps(result.structured_content, ensure_ascii=False)
@@ -61,9 +74,18 @@ def create_mcp_coroutine(tool_name: str):
     """
 
     async def call_mcp_tool(**arguments):
-        async with Client(create_server_parameters()) as client:
-            result = await client.call_tool(tool_name, arguments)
-            return mcp_result_to_text(result)
+        request_sent = False  # 连接尚未建立时，工具不可能已经产生副作用。
+        try:
+            async with Client(create_server_parameters()) as client:
+                request_sent = True  # 从这里起连接断开也不能断言“工具没有执行”。
+                result = await client.call_tool(tool_name, arguments)
+        except Exception as error:
+            if not is_transport_error(error):
+                raise  # 永久配置错误、未知错误交给主循环停止；取消信号不由此处捕获。
+            if request_sent and tool_name not in SAFE_TO_REPEAT:
+                raise NonRetryableError("MCP 连接中断，工具是否已执行不确定，不能自动重复有副作用的操作") from error
+            raise RetryableError("MCP 连接关闭或请求超时") from error  # 执行层原地补试，重新建立连接。
+        return mcp_result_to_text(result)  # 正常返回的工具错误仍交给模型改参，不原样补试。
 
     return call_mcp_tool
 

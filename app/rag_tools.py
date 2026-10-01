@@ -33,7 +33,7 @@ from app.config import (
     require_environment_variable,
     resolve_credential,
 )
-from app.tool_errors import RetryableError
+from app.tool_errors import FixableError
 from app.workspace_tools import MAX_READ_BYTES, resolve_workspace_path
 
 
@@ -164,7 +164,7 @@ def index_knowledge_base(relative_directory: str = ".") -> str:
 
     directory = resolve_workspace_path(relative_directory)
     if not directory.exists() or not directory.is_dir():
-        raise RetryableError(f"知识目录不存在或不是目录：{relative_directory}")
+        raise FixableError(f"知识目录不存在或不是目录：{relative_directory}")
 
     files = find_indexable_files(directory)
     if not files and not KNOWLEDGE_DATABASE_PATH.exists():
@@ -266,9 +266,9 @@ def search_knowledge_base(query: str, top_k: int = 4) -> str:
 
     question = query.strip()
     if not question:
-        raise RetryableError("RAG 查询不能为空。")
+        raise FixableError("RAG 查询不能为空。")
     if top_k < 1 or top_k > 8:
-        raise RetryableError("top_k 必须在 1 到 8 之间。")
+        raise FixableError("top_k 必须在 1 到 8 之间。")
     if not KNOWLEDGE_DATABASE_PATH.exists():
         return "知识库尚未建立。请先调用 index_knowledge_base。"
 

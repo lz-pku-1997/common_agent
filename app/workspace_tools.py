@@ -10,7 +10,7 @@ from pathlib import Path
 from langchain.tools import tool
 
 from app.config import MAX_TOOL_RESULT_CHARS, WORKSPACE_ROOT
-from app.tool_errors import NonRetryableError, RetryableError
+from app.tool_errors import NonRetryableError, FixableError
 
 
 ALLOWED_TEXT_SUFFIXES = {".md", ".txt", ".json", ".csv", ".py"}
@@ -47,7 +47,7 @@ def ensure_supported_text_file(path: Path) -> None:
 
     if path.suffix.lower() not in ALLOWED_TEXT_SUFFIXES:
         allowed = ", ".join(sorted(ALLOWED_TEXT_SUFFIXES))
-        raise RetryableError(f"不支持 {path.suffix or '无后缀'} 文件；允许类型：{allowed}")
+        raise FixableError(f"不支持 {path.suffix or '无后缀'} 文件；允许类型：{allowed}")
 
 
 @tool
@@ -56,9 +56,9 @@ def list_workspace_files(relative_directory: str = ".") -> str:
 
     directory = resolve_workspace_path(relative_directory)
     if not directory.exists():
-        raise RetryableError(f"目录不存在：{relative_directory}")
+        raise FixableError(f"目录不存在：{relative_directory}")
     if not directory.is_dir():
-        raise RetryableError(f"这不是目录：{relative_directory}")
+        raise FixableError(f"这不是目录：{relative_directory}")
 
     entries = sorted(directory.iterdir(), key=lambda item: (item.is_file(), item.name.lower()))
     if not entries:
@@ -86,16 +86,16 @@ def read_text_file(relative_path: str, start_line: int = 1, max_lines: int | Non
     """
 
     if start_line < 1:
-        raise RetryableError("start_line 必须从 1 开始。")
+        raise FixableError("start_line 必须从 1 开始。")
     if max_lines is not None and max_lines < 1:
-        raise RetryableError("max_lines 必须大于 0。")
+        raise FixableError("max_lines 必须大于 0。")
     page_size = 2000 if max_lines is None else max_lines
 
     path = resolve_workspace_path(relative_path)
     if not path.exists():
-        raise RetryableError(f"文件不存在：{relative_path}")
+        raise FixableError(f"文件不存在：{relative_path}")
     if not path.is_file():
-        raise RetryableError(f"这不是文件：{relative_path}")
+        raise FixableError(f"这不是文件：{relative_path}")
     ensure_supported_text_file(path)
     # 先流式数行，再流式取本页。多扫一遍是为了准确报告总行数，不把整份文件装进列表。
     with path.open(encoding="utf-8-sig", newline="") as file:
@@ -103,7 +103,7 @@ def read_text_file(relative_path: str, start_line: int = 1, max_lines: int | Non
         if total_lines == 0:
             return "[文件结束，共 0 行。]"
         if start_line > total_lines:
-            raise RetryableError(f"start_line 超出文件末尾，文件共 {total_lines} 行。")
+            raise FixableError(f"start_line 超出文件末尾，文件共 {total_lines} 行。")
         file.seek(0)  # 上面数行数已把文件读到末尾，游标拨回开头才能重新逐行取本页
         lines: list[str] = []
         used_chars = 0
@@ -137,14 +137,14 @@ def search_workspace_text(query: str, file_pattern: str = "*.md") -> str:
 
     keyword = query.strip()
     if not keyword:
-        raise RetryableError("搜索词不能为空。")
+        raise FixableError("搜索词不能为空。")
 
     # 具体路径只查一次；通配表达式沿用递归搜索，*.txt 仍能匹配子目录。
     try:
         paths = (WORKSPACE_ROOT.rglob(file_pattern) if any(char in file_pattern for char in "*?[")
                  else [WORKSPACE_ROOT / file_pattern])
     except (NotImplementedError, ValueError, OSError) as error:
-        raise RetryableError("不支持这种路径写法，请写成 '*.md'、'notes/*.md' 或某个文件路径。") from error
+        raise FixableError("不支持这种路径写法，请写成 '*.md'、'notes/*.md' 或某个文件路径。") from error
 
     matches: list[str] = []
     for path in paths:
@@ -179,9 +179,9 @@ def save_new_text_file(relative_path: str, content: str) -> str:
     ensure_supported_text_file(path)
 
     if path.exists():
-        raise RetryableError(f"文件已存在，出于安全考虑不覆盖：{relative_path}")
+        raise FixableError(f"文件已存在，出于安全考虑不覆盖：{relative_path}")
     if len(content) > MAX_WRITE_CHARACTERS:
-        raise RetryableError("内容超过 10 万字符，内核版拒绝一次性写入。")
+        raise FixableError("内容超过 10 万字符，内核版拒绝一次性写入。")
 
     # parents=True 会连同 notes/2026 这样的父目录一起建立。
     path.parent.mkdir(parents=True, exist_ok=True)

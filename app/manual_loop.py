@@ -39,6 +39,7 @@ context 只在接近预算时摘要旧消息；工具结果另有单条长度限
 把轮数耗完 —— 光靠模型自觉防不住转圈。
 """
 
+import asyncio
 import json
 from typing import Annotated, Any, Callable, TypedDict
 
@@ -55,7 +56,7 @@ from app.context import (
     limit_tool_result,
     model_messages,
 )
-from app.tool_errors import NonRetryableError, RetryableError
+from app.tool_errors import FixableError, NonRetryableError, RetryableError
 from app.tool_registry import ToolRegistry
 
 
@@ -66,6 +67,17 @@ MAX_TOOL_ROUNDS = 10
 
 # 可修正错误发生后，最多再给模型两次修改参数的机会。
 MAX_RETRIES = 2
+
+
+async def invoke_tool_with_retry(tool: BaseTool, arguments: dict):
+    """只重试明确可安全重复的服务故障；改参和未知错误不在这里处理。"""
+    for attempt in range(4):  # 首次调用 + 三次补试，总共最多调用四次。
+        try:
+            return await tool.ainvoke(arguments)  # 参数不变，不再调模型，也不重复询问审批。
+        except RetryableError:
+            if attempt == 3:  # 三次补试用完，把失败交给工具节点安全收尾。
+                raise
+            await asyncio.sleep((attempt + 1) ** 2)  # 依次等待 1、4、9 秒；等待时不阻塞事件循环。
 
 
 def _tool_call_signature(tool_call: dict[str, Any]) -> str:
@@ -251,8 +263,9 @@ def build_agent_graph(
     async def execute_tools_node(state: AgentState) -> dict[str, Any]:
         """工具节点：真的执行上一轮模型申请的工具，把结果回填成 ToolMessage。
 
-        RetryableError 和工具参数校验错误可交给模型有限次改参；
-        其他异常安全收口。所有工具请求都得到对应的 ToolMessage。
+        FixableError 和工具参数校验错误可交给模型有限次改参；
+        RetryableError 在同次工具调用内补试三次；耗尽和其他异常安全收口。
+        所有工具请求都得到对应的 ToolMessage。
         """
 
         # route_after_model 只有在最后一条消息带有 tool_calls 时才会把流程送到这里。
@@ -319,6 +332,7 @@ def build_agent_graph(
             signature = _tool_call_signature(call)
 
             if call["id"] in denied_ask_ids:
+                last_tool_call_signature = signature  # 人工拒绝也是明确结论，不能反复申请。
                 # 这条 ask 请求本身被用户拒绝；即使前面的 allow 工具先触发
                 # halt，也要把真实拒绝原因写给模型。
                 content = f"工具未执行：{tool_name} 未获得人工确认。"
@@ -351,10 +365,6 @@ def build_agent_graph(
                 )
                 continue
 
-            # 记录本次请求。即使后面因为 ask 或 deny 没有真正执行，也要记住它，
-            # 防止模型下一轮不断重复同一个被拒绝的请求。
-            last_tool_call_signature = signature
-
             # 先查项目级权限策略，再决定能不能进入真实 handler。
             # 这一步必须发生在 tool.ainvoke 之前；否则模型就能绕过 Registry，
             # 直接让一个 ask/deny 工具产生副作用。
@@ -367,6 +377,7 @@ def build_agent_graph(
                     policy = None
 
             if policy is not None and policy.permission == "deny":
+                last_tool_call_signature = signature  # 策略拒绝已有结论，不允许重复绕过。
                 # deny 是明确的策略拒绝，不把它伪装成“工具不存在”。
                 content = f"工具调用被权限策略拒绝：{tool_name}。当前 Agent 不允许使用它。"
                 stop_reason = "permission_denied"
@@ -390,9 +401,10 @@ def build_agent_graph(
             try:
                 if tool is None:
                     available = ", ".join(sorted(tools_by_name))
-                    raise RetryableError(f"工具不存在：{tool_name}。可用工具：{available}")
+                    raise FixableError(f"工具不存在：{tool_name}。可用工具：{available}")
                 # ainvoke 对同步工具和异步（MCP）工具都能用。
-                raw_content, artifact = limit_tool_result(str(await tool.ainvoke(call["args"])))
+                raw_content, artifact = limit_tool_result(str(await invoke_tool_with_retry(tool, call["args"])))
+                last_tool_call_signature = signature  # 执行成功才记录；服务内部补试不经过重复检查。
                 source = policy.source if policy is not None else "unknown"  # 来源取自程序登记记录，不由模型参数决定。
                 # Skill 来源由 Registry 确定，模型不能用参数把普通文件变成指南。
                 # 指南允许参考其中的任务步骤，但仍服从用户要求和真实工具权限。
@@ -406,11 +418,13 @@ def build_agent_graph(
             except Exception as error:
                 # 已知可修正错误交给模型有限次改参；未知异常默认停止。
                 status = "error"
-                if isinstance(error, RetryableError):
+                if isinstance(error, FixableError):
+                    last_tool_call_signature = signature  # 参数错误已有结论，下一次必须换参数。
                     detail = str(error).strip().rstrip("。.!！") or type(error).__name__
                     content = f"{detail}。请修改参数，不要重复相同请求。"
                     saw_retryable_error = True
                 elif isinstance(error, ValidationError):
+                    last_tool_call_signature = signature
                     # 工具入参缺字段或类型不对；只回传字段与原因，不传原始输入或帮助链接。
                     problems = "；".join(
                         f"{'.'.join(str(part) for part in item['loc']) or '入参'} {item['msg']}"
@@ -418,6 +432,10 @@ def build_agent_graph(
                     )
                     content = f"工具参数不合法：{problems}。请修改参数，不要重复相同请求。"
                     saw_retryable_error = True
+                elif isinstance(error, RetryableError):
+                    content = "工具服务暂时不可用，已按 1、4、9 秒等待并补试三次，仍未成功。本轮已安全停止。"
+                    stop_reason = "non_retryable_error"  # 不交给模型续试，避免叠加两套重试额度。
+                    halt_remaining_calls = True
                 else:
                     # 显式不可重试错误可说明原因；未知异常只暴露类型，不泄露内部细节。
                     if isinstance(error, NonRetryableError):

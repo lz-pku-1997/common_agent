@@ -12,7 +12,7 @@ from pathlib import Path
 from langchain.tools import tool
 
 from app.config import MEMORY_ROOT
-from app.tool_errors import NonRetryableError, RetryableError
+from app.tool_errors import NonRetryableError, FixableError
 
 MAX_USER_CHARS = 4000  # 画像每次都加载，因此比主题正文更短。
 MAX_INDEX_CHARS = 8000  # 索引只留标题、路径和一句说明。
@@ -28,7 +28,7 @@ def resolve_memory_path(relative_path: str) -> Path:
     if relative_path not in {"user.md", "memory.md"} and not re.fullmatch(
         r"topics/[a-z0-9]+(?:-[a-z0-9]+)*\.md", relative_path
     ):
-        raise RetryableError("请使用 user.md、memory.md 或 topics/英文短横线主题名.md。")
+        raise FixableError("请使用 user.md、memory.md 或 topics/英文短横线主题名.md。")
     return path
 
 
@@ -38,7 +38,7 @@ def read_memory_text(path: Path, limit: int) -> str:
     with path.open(encoding="utf-8-sig") as file:
         content = file.read(limit + 1)
     if len(content) > limit:
-        raise RetryableError(f"记忆 {path.name} 超过 {limit} 字符，请缩短或拆分主题。")
+        raise FixableError(f"记忆 {path.name} 超过 {limit} 字符，请缩短或拆分主题。")
     return content
 
 
@@ -47,11 +47,11 @@ def topic_description(content: str) -> tuple[str, str]:
 
     parts = content.split("\n\n", 2)
     if len(parts) != 3 or not parts[0].startswith("# ") or not parts[2].strip():
-        raise RetryableError("主题格式应为 # 标题、空行、一句话说明、空行、正文。")
+        raise FixableError("主题格式应为 # 标题、空行、一句话说明、空行、正文。")
     title, description = parts[0][2:].strip(), parts[1].strip()
     if (not title or len(title) > 80 or any(c in title for c in "\n[]")
             or not description or len(description) > 160 or "\n" in description):
-        raise RetryableError("标题须为 1～80 字符且不含换行或方括号；说明须为单行 1～160 字符。")
+        raise FixableError("标题须为 1～80 字符且不含换行或方括号；说明须为单行 1～160 字符。")
     return title, description
 
 
@@ -71,7 +71,7 @@ def render_memory_index(replacement: tuple[str, str] | None = None) -> str:
         lines.append(f"- [{title}]({relative_path}) — {description}")
     index = "\n".join(lines) + "\n"
     if len(index) > MAX_INDEX_CHARS:
-        raise RetryableError("记忆索引超过 8000 字符，请合并主题或缩短说明；正文未被截断。")
+        raise FixableError("记忆索引超过 8000 字符，请合并主题或缩短说明；正文未被截断。")
     return index
 
 
@@ -100,7 +100,7 @@ def load_memory_context() -> str:
     index_path = resolve_memory_path("memory.md")
     try:
         old_index = read_memory_text(index_path, MAX_INDEX_CHARS) if index_path.exists() else ""
-    except RetryableError:
+    except FixableError:
         old_index = ""  # 派生索引被人工写得过长也能重建；主题正文仍受自己的预算约束。
     if old_index != index:
         atomic_write(index_path, index)  # 索引是派生数据，冷启动、缺失或人工改主题后自动修复。
@@ -113,10 +113,10 @@ def save_memory_content(relative_path: str, content: str) -> str:
     """先检查正文与新索引预算，再写正文；索引可在下一次加载时恢复。"""
 
     if relative_path == "memory.md":
-        raise RetryableError("memory.md 由程序生成，请修改 user.md 或主题正文。")
+        raise FixableError("memory.md 由程序生成，请修改 user.md 或主题正文。")
     limit = MAX_USER_CHARS if relative_path == "user.md" else MAX_TOPIC_CHARS
     if not content.strip() or len(content) > limit:
-        raise RetryableError(f"内容不能为空，且不能超过 {limit} 字符。")
+        raise FixableError(f"内容不能为空，且不能超过 {limit} 字符。")
     replacement = (relative_path, content) if relative_path.startswith("topics/") else None
     index = render_memory_index(replacement)  # 在改变原文件前验证主题格式及索引总长度。
     atomic_write(resolve_memory_path(relative_path), content)
@@ -134,7 +134,7 @@ def memory_read(relative_path: str) -> str:
 
     path = resolve_memory_path(relative_path)
     if not path.is_file():
-        raise RetryableError(f"记忆不存在：{relative_path}")
+        raise FixableError(f"记忆不存在：{relative_path}")
     limit = MAX_USER_CHARS if relative_path == "user.md" else MAX_TOPIC_CHARS
     return f"[记忆文件：{relative_path}]\n" + read_memory_text(path, limit)
 
@@ -149,7 +149,7 @@ def create_memory(relative_path: str, content: str) -> str:
 
     path = resolve_memory_path(relative_path)
     if path.exists():
-        raise RetryableError("记忆已存在，请先 memory_read，再用 update_memory 修改。")
+        raise FixableError("记忆已存在，请先 memory_read，再用 update_memory 修改。")
     return save_memory_content(relative_path, content)
 
 
@@ -163,11 +163,11 @@ def update_memory(relative_path: str, old_text: str, new_text: str) -> str:
 
     path = resolve_memory_path(relative_path)
     if not path.is_file():
-        raise RetryableError("记忆不存在，请先用 create_memory 新建。")
+        raise FixableError("记忆不存在，请先用 create_memory 新建。")
     limit = MAX_USER_CHARS if relative_path == "user.md" else MAX_TOPIC_CHARS
     content = read_memory_text(path, limit)
     if not old_text or content.count(old_text) != 1:
-        raise RetryableError("旧文本必须精确且只匹配一次；文件可能已变更，请重新读取。")
+        raise FixableError("旧文本必须精确且只匹配一次；文件可能已变更，请重新读取。")
     return save_memory_content(relative_path, content.replace(old_text, new_text, 1))
 
 

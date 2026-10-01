@@ -11,7 +11,7 @@ from langchain.tools import tool
 from langchain_core.tools import BaseTool
 
 from app.config import MAX_TOOL_RESULT_CHARS, SKILLS_ROOT
-from app.tool_errors import NonRetryableError, RetryableError
+from app.tool_errors import NonRetryableError, FixableError
 
 
 def load_skill_catalog() -> dict[str, tuple[str, Path]]:  # 返回“技能名 -> (用途, 文件路径)”的字典。
@@ -66,7 +66,7 @@ def build_skill_tools(catalog: dict[str, tuple[str, Path]]) -> list[BaseTool]:  
         """读取一个已登记 Skill 的完整操作指南。name 必须来自系统提示中的 Skill 清单。"""
 
         if name not in catalog:  # 只接受启动扫描时登记的名字，不接受模型传入任意文件路径。
-            raise RetryableError(f"Skill 不存在：{name}。可用名称：{', '.join(catalog)}")
+            raise FixableError(f"Skill 不存在：{name}。可用名称：{', '.join(catalog)}")
         path = catalog[name][1].resolve()  # 清单里的第 2 项是路径；调用时重新解析以发现路径变化。
         # 调用时再核对一次，防止启动后有人把目录改成指向外面的符号链接。
         if not path.is_relative_to(SKILLS_ROOT):  # 再做一次边界检查，防止启动后符号链接被替换。
