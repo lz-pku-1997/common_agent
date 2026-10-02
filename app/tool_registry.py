@@ -99,6 +99,8 @@ def build_tool_registry(
     mcp_tools: list[BaseTool],
     skill_tools: list[BaseTool] | None = None,  # 可选参数，保留旧调用方不传 Skill 工具时的兼容性。
     memory_tools: list[BaseTool] | None = None,
+    web_tools: list[BaseTool] | None = None,
+    routing_tools: list[BaseTool] | None = None,
 ) -> ToolRegistry:
     """按来源和工具名定权限；未配置的新工具必须先获得人工确认。"""
 
@@ -128,6 +130,8 @@ def build_tool_registry(
             "create_memory": "ask",  # 新建和修改都真实写盘，审批参数会展示路径及内容。
             "update_memory": "ask",
         },
+        "web": {},  # 查询会发送到外部且可能计费；不列 allow 白名单，默认人工确认。
+        "routing": {"upgrade_to_strong": "allow"},  # 只改变模型档位，不改变其他工具权限。
     }
 
     for source, tools in (
@@ -136,6 +140,8 @@ def build_tool_registry(
         ("mcp", mcp_tools),
         ("skills", skill_tools or []),  # None 转为空列表，统一走下面同一套登记循环。
         ("memory", memory_tools or []),
+        ("web", web_tools or []),
+        ("routing", routing_tools or []),
     ):
         for tool in tools:
             # 新工具仍进入模型说明书，但执行前走已有 HITL 确认。

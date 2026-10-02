@@ -51,14 +51,20 @@ def resolve_credential(name: str, fallback: str) -> str:
     return os.getenv(name, "").strip() or require_environment_variable(fallback)
 
 
-def load_model_settings() -> dict[str, str | int]:
+def load_model_settings(mode: str) -> dict[str, str | int]:
     """返回创建模型所需的配置，但不打印密钥。"""
 
+    if mode not in {"fast", "strong"}:
+        raise ValueError("模型模式只能是 fast 或 strong。")
+    prefix = f"LLM_{mode.upper()}"  # 聊天模型必须明确选择 fast 或 strong，不再隐式回落到通用配置。
+    window = int(require_environment_variable(f"{prefix}_MAX_INPUT_TOKENS"))
+    if window <= 0:
+        raise ValueError(f"{prefix}_MAX_INPUT_TOKENS 必须大于 0。")
     return {
         "api_key": require_environment_variable("LLM_API_KEY"),
         "base_url": require_environment_variable("LLM_BASE_URL"),
-        "model": require_environment_variable("LLM_MODEL"),
-        "max_input_tokens": int(require_environment_variable("LLM_MAX_INPUT_TOKENS")),
+        "model": require_environment_variable(f"{prefix}_MODEL"),
+        "max_input_tokens": window,
     }
 
 

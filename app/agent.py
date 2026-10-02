@@ -7,28 +7,30 @@
 from langchain_openai import ChatOpenAI
 
 from app.config import AGENT_RULES_PATH, load_model_settings
-from app.manual_loop import build_agent_graph
+from app.manual_loop import build_agent_graph, upgrade_to_strong
 from app.mcp_bridge import load_mcp_tools
 from app.memory import MEMORY_TOOLS, load_memory_context
 from app.rag_tools import RAG_TOOLS
 from app.skills import build_skill_tools, load_skill_catalog
 from app.tool_registry import build_tool_registry
 from app.workspace_tools import WORKSPACE_TOOLS
+from app.web_tools import WEB_TOOLS
 
 
-def create_chat_model() -> ChatOpenAI:
+def create_chat_model(mode: str) -> ChatOpenAI:
     """按照 .env 创建真实聊天模型。
 
     ChatOpenAI 在这里是“OpenAI 兼容协议客户端”，不代表只能调用 OpenAI。
     当前 .env 指向 DashScope，所以请求会真正发给千问。
     """
 
-    settings = load_model_settings()
+    settings = load_model_settings(mode)  # 模型名与输入窗口成对切换；地址和密钥共用。
     return ChatOpenAI(
         model=settings["model"],
         api_key=settings["api_key"],
         base_url=settings["base_url"],
         temperature=0,
+        streaming=True,
         timeout=60,
         max_retries=2,
         profile={"max_input_tokens": settings["max_input_tokens"]},
@@ -56,12 +58,13 @@ async def build_common_agent(checkpointer):
     # 先登记来源和权限，再把允许暴露的工具交给主循环。
     # LangChain 仍负责 Tool/Schema；Registry 只负责项目自己的治理元数据。
     tool_registry = build_tool_registry(  # 把 Skill 工具和其他来源放进同一权限登记表。
-        WORKSPACE_TOOLS, RAG_TOOLS, mcp_tools, build_skill_tools(catalog), MEMORY_TOOLS
+        WORKSPACE_TOOLS, RAG_TOOLS, mcp_tools, build_skill_tools(catalog), MEMORY_TOOLS, WEB_TOOLS,
+        [upgrade_to_strong],  # 升级是内置控制工具，也经过同一权限登记与执行出口。
     )
-    model = create_chat_model()
+    models = {mode: create_chat_model(mode) for mode in ("fast", "strong")}  # 共用一个图；State 档位决定本次调用哪个客户端。
 
     return build_agent_graph(
-        model=model,
+        models=models,
         tools=tool_registry.tools_for_model(),  # 交给模型可见的工具；deny 工具在这里被过滤掉。
         tool_registry=tool_registry,
         system_prompt=system_prompt,

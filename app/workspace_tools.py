@@ -178,14 +178,16 @@ def save_new_text_file(relative_path: str, content: str) -> str:
     path = resolve_workspace_path(relative_path)
     ensure_supported_text_file(path)
 
-    if path.exists():
-        raise FixableError(f"文件已存在，出于安全考虑不覆盖：{relative_path}")
     if len(content) > MAX_WRITE_CHARACTERS:
         raise FixableError("内容超过 10 万字符，内核版拒绝一次性写入。")
 
     # parents=True 会连同 notes/2026 这样的父目录一起建立。
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    try:
+        with path.open("x", encoding="utf-8") as file:  # x 只允许新建；目标已存在时拒绝打开，不会覆盖。
+            file.write(content)
+    except FileExistsError as error:
+        raise FixableError(f"文件已存在，出于安全考虑不覆盖：{relative_path}") from error
     relative_name = path.relative_to(WORKSPACE_ROOT).as_posix()
     return f"已真实新建文件：{relative_name}（{len(content)} 个字符）"
 
