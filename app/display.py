@@ -91,7 +91,7 @@ def print_turn_end(result: dict, old_message_count: int, answer_streamed: bool, 
         "retry_limit": "参数修正次数已用完，本轮任务未完成。",
         "permission_denied": "工具调用被权限策略拒绝，本轮任务未完成。",
         "approval_denied": "你未批准工具操作，因此没有执行，本轮任务未完成。",
-        "retry_exhausted": "工具服务补试三次仍未成功，本轮任务未完成。",
+        "retry_exhausted": "工具服务补试四次仍未成功，本轮任务未完成。",
         "non_retryable_error": "工具发生不可重试错误，本轮任务已安全停止。",
     }
     text = reasons.get(result.get("stop_reason"))

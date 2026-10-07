@@ -79,16 +79,16 @@ def upgrade_to_strong(reason: str) -> str:
 
 async def invoke_tool_with_retry(tool: BaseTool, arguments: dict, progress=None):
     """只重试明确可安全重复的服务故障；改参和未知错误不在这里处理。"""
-    for attempt in range(4):  # 首次调用 + 三次补试，总共最多调用四次。
+    for attempt in range(5):  # 首次调用 + 四次补试，总共最多调用五次。
         try:
             return await tool.ainvoke(arguments)  # 参数不变，不再调模型，也不重复询问审批。
         except RetryableError:
-            if attempt == 3:  # 三次补试用完，把失败交给工具节点安全收尾。
+            if attempt == 4:  # 四次补试用完，把失败交给工具节点安全收尾。
                 raise
-            delay = (attempt + 1) ** 2
+            delay = 2**attempt  # 指数退避：依次等待 1、2、4、8 秒。
             if progress is not None:
                 progress({"type": "retry", "name": tool.name, "attempt": attempt + 1, "delay": delay})  # 只观察补试，不改变执行或审批次数。
-            await asyncio.sleep(delay)  # 依次等待 1、4、9 秒；等待时不阻塞事件循环。
+            await asyncio.sleep(delay)  # 依次等待 1、2、4、8 秒；等待时不阻塞事件循环。
 
 
 def _tool_call_signature(tool_call: dict[str, Any]) -> str:
@@ -320,7 +320,7 @@ def build_agent_graph(
         """工具节点：真的执行上一轮模型申请的工具，把结果回填成 ToolMessage。
 
         FixableError 和工具参数校验错误可交给模型有限次改参；
-        RetryableError 在同次工具调用内补试三次；耗尽和其他异常安全收口。
+        RetryableError 在同次工具调用内补试四次；耗尽和其他异常安全收口。
         所有工具请求都得到对应的 ToolMessage。
         """
 
@@ -467,7 +467,7 @@ def build_agent_graph(
                     content = f"工具参数不合法：{problems}。请修改参数，不要重复相同请求。"
                     saw_fixable_error = True
                 elif isinstance(error, RetryableError):
-                    content = "工具服务暂时不可用，已按 1、4、9 秒等待并补试三次，仍未成功。本轮已安全停止。"
+                    content = "工具服务暂时不可用，已按 1、2、4、8 秒等待并补试四次，仍未成功。本轮已安全停止。"
                     stop_reason = "retry_exhausted"  # 服务故障可补试，但额度已用完；不叠加模型重试。
                 else:
                     # 显式不可重试错误可说明原因；未知异常只暴露类型，不泄露内部细节。
