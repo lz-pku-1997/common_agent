@@ -4,10 +4,10 @@ LangChain 已经负责把 Python 函数包装成 Tool、生成参数 Schema，�
 暴露工具说明。这里不重复实现这些能力，只补项目自己的治理信息：
 
 * 工具从哪里来；
-* 工具默认采用 allow、ask 还是 deny；
+* 工具固定 allow、固定 ask，还是交给安全子 Agent 逐次审查（None）；
 
-三档策略已经接入执行链：allow 直接执行，ask 触发 LangGraph interrupt，
-deny 直接拒绝。参数校验由各工具 handler 负责，不在这里重复登记一个布尔字段。
+子 Agent 返回 allow / ask / deny；人工确认仍只在主图触发 interrupt。
+参数校验由各工具 handler 负责，不因为模型允许就跳过路径等硬限制。
 """
 
 from dataclasses import dataclass
@@ -15,21 +15,21 @@ from dataclasses import dataclass
 from langchain_core.tools import BaseTool
 
 
-PermissionMode = str  # 约定只使用："allow"、"ask"、"deny"
+PermissionMode = str | None  # None 表示未定级，不等于拒绝或允许。
 
 
 @dataclass(frozen=True, slots=True)
 class ToolPolicy:
     """一个工具在 common_agent 中的治理策略。
 
-    ``permission`` 是三档决策：
+    ``permission`` 是初始策略：
     - allow：可以自动执行；
     - ask：执行前通过 LangGraph interrupt 请求人工确认；
-    - deny：不应交给当前 Agent 执行。
+    - None：每次调用交给安全子 Agent 决定，不修改登记表。
     """
 
     source: str
-    permission: PermissionMode
+    permission: PermissionMode = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,23 +56,13 @@ class ToolRegistry:
 
         if tool.name in self._entries:
             raise ValueError(f"工具名称重复，拒绝覆盖已有登记：{tool.name}")
-        if policy.permission not in {"allow", "ask", "deny"}:
+        if policy.permission not in {"allow", "ask", None}:
             raise ValueError(f"不支持的权限模式：{policy.permission}")
         self._entries[tool.name] = RegisteredTool(tool=tool, policy=policy)
 
     def tools_for_model(self) -> list[BaseTool]:
-        """返回允许暴露给模型的工具。
-
-        deny 工具不会进入模型说明书；ask 工具仍会进入说明书，执行节点
-        再根据策略触发人工确认。这样“模型知道工具存在”和“工具可以直接执行”
-        是两个明确的层次。
-        """
-
-        return [
-            entry.tool
-            for entry in self._entries.values()
-            if entry.policy.permission != "deny"
-        ]
+        """登记的工具都可见；不能提供的能力不登记，逐次审查可拒绝某次调用。"""
+        return [entry.tool for entry in self._entries.values()]
 
     def as_tool_map(self) -> dict[str, BaseTool]:
         """生成执行节点需要的“工具名 -> Tool”查找表。"""
@@ -97,12 +87,13 @@ def build_tool_registry(
     workspace_tools: list[BaseTool],
     rag_tools: list[BaseTool],
     mcp_tools: list[BaseTool],
-    skill_tools: list[BaseTool] | None = None,  # 可选参数，保留旧调用方不传 Skill 工具时的兼容性。
+    skill_tools: list[BaseTool] | None = None,  # 没有此类工具时省略，下面统一按空清单处理。
     memory_tools: list[BaseTool] | None = None,
     web_tools: list[BaseTool] | None = None,
     routing_tools: list[BaseTool] | None = None,
+    shell_tools: list[BaseTool] | None = None,
 ) -> ToolRegistry:
-    """按来源和工具名定权限；未配置的新工具必须先获得人工确认。"""
+    """只固定明确的策略；没有配置的工具交给安全子 Agent，不默认放行。"""
 
     registry = ToolRegistry()
     # 只给明确列出的只读工具自动执行权限。按来源分表，避免外部 MCP 工具
@@ -112,26 +103,21 @@ def build_tool_registry(
             "list_workspace_files": "allow",
             "read_text_file": "allow",
             "search_workspace_text": "allow",
-            "save_new_text_file": "ask",  # 新建文件会真实写盘。
+            "delete_file": "ask",  # 删除整个文件不进入回收站，必须获得批准。
         },
         "rag": {
             "search_knowledge_base": "allow",
-            "index_knowledge_base": "ask",  # 写数据库并消耗 Embedding 额度。
         },
-        "mcp": {
-            "add_numbers": "allow",
-            "get_current_time": "allow",
-        },
+        "mcp": {},  # 远程工具均未定级，仍经过安全子 Agent 审查。
         "skills": {
             "skill_view": "allow",  # 只读登记过的指南；allow 不会赋予指南里的操作额外权限。
         },
         "memory": {
             "memory_read": "allow",
-            "create_memory": "ask",  # 新建和修改都真实写盘，审批参数会展示路径及内容。
-            "update_memory": "ask",
         },
-        "web": {},  # 查询会发送到外部且可能计费；不列 allow 白名单，默认人工确认。
+        "web": {},  # 外部查询交给子 Agent 审查；本轮不增加敏感信息检测。
         "routing": {"upgrade_to_strong": "allow"},  # 只改变模型档位，不改变其他工具权限。
+        "shell": {},  # 不再接受主模型自报免审批，统一交给独立子 Agent 审查。
     }
 
     for source, tools in (
@@ -142,11 +128,10 @@ def build_tool_registry(
         ("memory", memory_tools or []),
         ("web", web_tools or []),
         ("routing", routing_tools or []),
+        ("shell", shell_tools or []),
     ):
         for tool in tools:
-            # 新工具仍进入模型说明书，但执行前走已有 HITL 确认。
-            # 要明确禁止某个工具，在上面的表中将其配置为 deny 即可。
-            permission = permissions_by_source[source].get(tool.name, "ask")  # 新工具没列入白名单时默认 ask。
+            permission = permissions_by_source[source].get(tool.name)  # 未登记策略为 None，执行前必须审查。
             registry.register(tool, ToolPolicy(source=source, permission=permission))
 
     return registry

@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "amap": {
+      "url": "https://mcp.amap.com/mcp?key=${AMAP_API_KEY}",
+      "tools": [
+        "maps_text_search",
+        "maps_direction_driving",
+        "maps_direction_walking",
+        "maps_direction_bicycling",
+        "maps_direction_transit_integrated",
+        "maps_weather"
+      ]
+    },
+    "context7": {
+      "url": "https://mcp.context7.com/mcp",
+      "tools": [
+        "resolve-library-id",
+        "query-docs"
+      ]
+    }
+  }
+}

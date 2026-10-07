@@ -1,7 +1,7 @@
 """分层文件记忆：画像与索引常驻，动态主题按需读取。
 
 主题文件是正文的唯一来源；memory.md 由程序重建，人工改主题后索引也能跟上。
-新建和更新工具都由 Registry 配为 ask，批准后才执行这里的真实写入。
+新建和更新先经过权限审查；若结果为 ask，主 Agent 批准后才执行真实写入。
 """
 
 import os
@@ -141,7 +141,7 @@ def memory_read(relative_path: str) -> str:
 
 @tool
 def create_memory(relative_path: str, content: str) -> str:
-    """新建用户画像或动态主题，执行前需人工批准；不覆盖已有文件。
+    """新建用户画像或动态主题，执行前经过权限审查；不覆盖已有文件。
 
     relative_path 只能为 user.md 或 topics/英文短横线主题名.md。
     主题 content 格式为 '# 标题\n\n一句话说明\n\n记忆正文'；user.md 保存用户画像与偏好。
@@ -155,7 +155,7 @@ def create_memory(relative_path: str, content: str) -> str:
 
 @tool
 def update_memory(relative_path: str, old_text: str, new_text: str) -> str:
-    """更新已有记忆，执行前需批准；用新文本替换唯一匹配的旧文本，保留其余内容。
+    """更新已有记忆，执行前经过权限审查；用新文本替换唯一匹配的旧文本，保留其余内容。
 
     请先 memory_read，再提供原文中的精确 old_text；旧文本不存在或出现多次会拒绝更新。
     也可把已读取的完整文件作为 old_text、更新后的完整文件作为 new_text。

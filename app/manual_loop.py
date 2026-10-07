@@ -17,7 +17,7 @@ r"""手写的 Agent 主循环：把「模型 -> 工具 -> 再问模型」一步�
 图长这样
 ------------------------------------------------------------------
 
-    START ──> [context] ──> [model] ──有 tool_calls──> [tools]
+    START ──> [context] ──> [model] ──有 tool_calls──> [review] ──> [tools]
                  ^             │                         │
                  │             │ 没有 tool_calls         │ 可继续
                  │             v                         │
@@ -159,14 +159,16 @@ class AgentState(TypedDict):
     conversation_summary: str
     summary_cursor: int
     model_mode: str  # 档位随 checkpoint 持久化；同一会话只允许 fast -> strong。
+    tool_permissions: dict[str, str]  # 当前批次的调用 ID -> 决策；每批覆盖，不是工具的永久授权。
 
 
 def build_agent_graph(
     models: dict[str, Any],
     tools: list[BaseTool],
     system_prompt: str,
+    tool_registry: ToolRegistry,
+    safety_reviewer: Callable,
     checkpointer=None,
-    tool_registry: ToolRegistry | None = None,
     memory_context_loader: Callable[[], str] | None = None,
 ):
     """把上面的图画出来并编译。
@@ -174,7 +176,7 @@ def build_agent_graph(
     这个函数只负责三件事：
 
     1. 把工具对象整理成“工具名 -> 工具对象”的本地查找表；
-    2. `context` 负责输入预算，`model` 负责决策，`tools` 负责执行或交接升级；
+    2. `context` 管预算，`model` 做决策，`review` 审查权限，`tools` 执行或交接升级；
     3. 用条件边把循环和两个出口连起来。
 
     返回的是 LangGraph 的 CompiledStateGraph，上层用 `ainvoke` / `aget_state` 驱动。
@@ -183,11 +185,8 @@ def build_agent_graph(
     """
 
     # 模型返回的 tool_call 只有一个字符串名字，例如 "read_text_file"；
-    # 这里优先使用项目级 Registry 的查找表，确保“模型看到的工具”和“执行时
-    # 能找到的工具”来自同一份登记。没有传 Registry 时仍保留普通列表兼容性。
-    tools_by_name: dict[str, BaseTool] = (
-        tool_registry.as_tool_map() if tool_registry else {tool.name: tool for tool in tools}
-    )
+    # 使用必传的 Registry，确保模型看到的工具和执行时的查找表来自同一份登记。
+    tools_by_name: dict[str, BaseTool] = tool_registry.as_tool_map()
 
     # bind_tools 把工具的 JSON Schema 交给模型，但不执行任何东西。
     # 模型拿到的只是“说明书”；真正动手的永远是下面的 execute_tools_node。
@@ -281,6 +280,42 @@ def build_agent_graph(
             "model_mode": mode,  # 第一次默认选 fast 后也写入 checkpoint，退出重启仍沿用该会话档位。
         }
 
+    async def review_tools_node(state: AgentState) -> dict[str, Any]:
+        """并发审查未定级调用；结果先进入 checkpoint，再到工具节点等待人工确认。"""
+        permissions = {}  # 每次重新建表，上一批次的批准不能被下一批复用。
+        pending = []
+        progress = get_stream_writer()
+        user_request = ""
+        for message in reversed(state["messages"]):
+            if isinstance(message, HumanMessage):
+                user_request = message.text  # 只带本轮原始诉求，不把父 Agent 的整段推理历史传给子 Agent。
+                break
+
+        for call in state["messages"][-1].tool_calls:
+            tool = tools_by_name.get(call["name"])
+            if tool is None:
+                continue  # 不存在的工具交给执行节点报参数错误，不启动审查。
+            policy = tool_registry.policy_for(call["name"])
+            if policy.permission is not None:
+                permissions[call["id"]] = policy.permission  # 固定权限直接记录；None 等审查结果出来后再记录。
+                continue
+            schema = tool.args_schema
+            if schema is not None and not isinstance(schema, dict):
+                schema = schema.model_json_schema()  # Python 工具和 MCP 工具都传实际参数契约。
+            request = {
+                "tool": tool.name, "description": tool.description, "schema": schema,
+                "source": policy.source, "arguments": call.get("args", {}), "user_request": user_request,
+            }
+            progress({"type": "review_start", "name": tool.name})
+            pending.append((call, safety_reviewer(request)))  # 先保存审查协程，下面 gather 再并发运行。
+        decisions = await asyncio.gather(*(task for _, task in pending), return_exceptions=True)  # 某个审查失败不丢失其他决定；真正的工具仍串行执行。
+        for (call, _), decision in zip(pending, decisions):
+            if not isinstance(decision, str) or decision not in {"allow", "ask", "deny"}:
+                decision = "ask"  # 异常和非法值只收紧当前调用，不静默批准。
+            permissions[call["id"]] = decision
+            progress({"type": "review_result", "name": call["name"], "permission": decision})
+        return {"tool_permissions": permissions}  # 独立节点完成后保存；interrupt 恢复不会重新取证。
+
     async def execute_tools_node(state: AgentState) -> dict[str, Any]:
         """工具节点：真的执行上一轮模型申请的工具，把结果回填成 ToolMessage。
 
@@ -311,20 +346,21 @@ def build_agent_graph(
 
         # 不可重试错误出现后，后续同批工具不再执行，避免继续产生副作用。
         # 但仍为每个 tool_call 补一条 ToolMessage，保持消息协议完整。
-        halt_remaining_calls = False
+        permissions = state.get("tool_permissions", {})
+        denied_ids = {call["id"] for call in tool_calls if permissions.get(call["id"]) == "deny"}
+        if denied_ids:
+            stop_reason = "permission_denied"  # 同批已有拒绝时整批不动手，停止原因就是唯一的停止依据。
 
         # 先找出本轮所有 ask 工具，再统一请求一次确认。
         # 不能先执行 allow 工具、执行到 ask 才 interrupt：LangGraph 从 interrupt
         # 恢复时会重新运行当前节点，前面已经产生的副作用可能被重复执行。
         ask_requests: list[dict[str, Any]] = []
-        if tool_registry is not None:
+        if not denied_ids:
             for call in tool_calls:
-                try:
-                    policy = tool_registry.policy_for(call["name"])
-                except KeyError:
+                if call["name"] not in tools_by_name:
                     continue
                 if (
-                    policy.permission == "ask"
+                    permissions.get(call["id"], "ask") == "ask"
                     and _tool_call_signature(call) != last_tool_call_signature
                 ):
                     ask_requests.append(
@@ -335,7 +371,7 @@ def build_agent_graph(
                         }
                     )
 
-        approval_granted = True
+        denied_ask_ids = set()  # 无人拒绝时保持空集合；拒绝后记录具体哪些请求没有获得批准。
         if ask_requests:
             approval = interrupt(
                 {
@@ -346,81 +382,39 @@ def build_agent_graph(
             )
             # CLI 固定用 {"approved": True/False} 恢复。这里只接受明确的布尔 True；
             # 缺少字段、False 或其他类型全部按拒绝处理，保持 fail-safe。
-            approval_granted = (
-                isinstance(approval, dict) and approval.get("approved") is True
-            )
-
-        denied_ask_ids = (
-            {request["tool_call_id"] for request in ask_requests}
-            if not approval_granted else set()
-        )
+            if not (isinstance(approval, dict) and approval.get("approved") is True):
+                stop_reason = "approval_denied"  # 进入执行循环前就确定整批停止，不等遇到某个 ask 工具才处理。
+                denied_ask_ids = {request["tool_call_id"] for request in ask_requests}  # 区分自身被拒绝与同批连带跳过。
 
         for call in tool_calls:
             tool_name = call["name"]
             tool = tools_by_name.get(tool_name)
             signature = _tool_call_signature(call)
 
-            if call["id"] in denied_ask_ids:
-                last_tool_call_signature = signature  # 人工拒绝也是明确结论，不能反复申请。
-                # 这条 ask 请求本身被用户拒绝；即使前面的 allow 工具先触发
-                # halt，也要把真实拒绝原因写给模型。
-                content = f"工具未执行：{tool_name} 未获得人工确认。"
-                stop_reason = "approval_denied"
-                halt_remaining_calls = True
-                record_result(
-                    ToolMessage(content=content, tool_call_id=call["id"], name=tool_name, status="error")
-                )
-                continue
+            if stop_reason is not None:  # 已有停止原因就不执行；审批拒绝、重复请求和严重错误共用这个出口。
+                content = "工具未执行：前序请求已使本轮安全停止。"  # 默认说明当前调用是被连带跳过的。
 
-            if halt_remaining_calls:
-                content = (
-                    "工具未执行：同批人工确认未通过。"
-                    if stop_reason == "approval_denied"
-                    else "工具未执行：前序请求已使本轮安全停止。"
-                )
+                if call["id"] in denied_ids:
+                    last_tool_call_signature = signature  # 安全拒绝已有明确结论，记录当前请求。
+                    content = f"工具未执行：安全子 Agent 拒绝了 {tool_name} 的这次调用。"
+                elif stop_reason == "permission_denied":
+                    content = "工具未执行：同批存在被安全子 Agent 拒绝的调用。"  # 当前调用被安全审查的整批停止规则连带跳过。
+
+                elif call["id"] in denied_ask_ids:
+                    last_tool_call_signature = signature  # 人工拒绝已有明确结论，记录当前请求。
+                    content = f"工具未执行：{tool_name} 未获得人工确认。"
+                elif stop_reason == "approval_denied":
+                    content = "工具未执行：同批人工确认未通过。"  # 当前调用本身不是 ask，但本批审批被拒绝。
+
                 record_result(
                     ToolMessage(content=content, tool_call_id=call["id"], name=tool_name, status="error")
                 )
                 continue
 
             if signature == last_tool_call_signature:
-                # 无论工具最后会被 allow、ask 还是 deny，都不能让同一个请求
-                # 一直重复占用模型轮次。先做这层检查，再做权限分发。
+                # 当前批次未被拒绝时，仍拦截连续重复请求，避免一直占用模型轮次。
                 content = f"检测到重复工具请求：{tool_name}。相同参数已经处理过，本轮停止继续调用。"
                 stop_reason = "repeated_tool_call"
-                halt_remaining_calls = True
-                record_result(
-                    ToolMessage(content=content, tool_call_id=call["id"], name=tool_name, status="error")
-                )
-                continue
-
-            # 先查项目级权限策略，再决定能不能进入真实 handler。
-            # 这一步必须发生在 tool.ainvoke 之前；否则模型就能绕过 Registry，
-            # 直接让一个 ask/deny 工具产生副作用。
-            policy = None
-            if tool_registry is not None:
-                try:
-                    policy = tool_registry.policy_for(tool_name)
-                except KeyError:
-                    # 未登记的工具和不存在的工具一样，都不能执行。
-                    policy = None
-
-            if policy is not None and policy.permission == "deny":
-                last_tool_call_signature = signature  # 策略拒绝已有结论，不允许重复绕过。
-                # deny 是明确的策略拒绝，不把它伪装成“工具不存在”。
-                content = f"工具调用被权限策略拒绝：{tool_name}。当前 Agent 不允许使用它。"
-                stop_reason = "permission_denied"
-                halt_remaining_calls = True
-                record_result(
-                    ToolMessage(content=content, tool_call_id=call["id"], name=tool_name, status="error")
-                )
-                continue
-
-            if ask_requests and not approval_granted:
-                # 同批中即使是 allow 工具，审批被拒绝后也不再继续执行。
-                content = "工具未执行：同批人工确认未通过。"
-                stop_reason = "approval_denied"
-                halt_remaining_calls = True
                 record_result(
                     ToolMessage(content=content, tool_call_id=call["id"], name=tool_name, status="error")
                 )
@@ -431,6 +425,7 @@ def build_agent_graph(
                 if tool is None:
                     available = ", ".join(sorted(tools_by_name))
                     raise FixableError(f"工具不存在：{tool_name}。可用工具：{available}")
+                policy = tool_registry.policy_for(tool_name)  # 已存在的工具均来自注册表，直接读取程序登记的来源。
                 # ainvoke 对同步工具和异步（MCP）工具都能用。
                 progress({"type": "tool_start", "name": tool_name})  # 已通过权限和审批，才报告真正开始执行。
                 tool_result = await asyncio.wait_for(
@@ -442,7 +437,7 @@ def build_agent_graph(
                     model_mode = "strong"  # 只允许单向升级，不清空消息、不重跑已经执行的工具。
                     progress({"type": "model_upgrade", "model": models["strong"].model_name})
                 last_tool_call_signature = signature  # 执行成功才记录；服务内部补试不经过重复检查。
-                source = policy.source if policy is not None else "unknown"  # 来源取自程序登记记录，不由模型参数决定。
+                source = policy.source  # 来源取自必传的注册表，不由模型参数决定。
                 # Skill 来源由 Registry 确定，模型不能用参数把普通文件变成指南。
                 # 指南允许参考其中的任务步骤，但仍服从用户要求和真实工具权限。
                 if source == "routing":
@@ -474,7 +469,6 @@ def build_agent_graph(
                 elif isinstance(error, RetryableError):
                     content = "工具服务暂时不可用，已按 1、4、9 秒等待并补试三次，仍未成功。本轮已安全停止。"
                     stop_reason = "retry_exhausted"  # 服务故障可补试，但额度已用完；不叠加模型重试。
-                    halt_remaining_calls = True
                 else:
                     # 显式不可重试错误可说明原因；未知异常只暴露类型，不泄露内部细节。
                     if isinstance(error, NonRetryableError):
@@ -483,7 +477,6 @@ def build_agent_graph(
                     else:
                         content = f"工具无法继续执行（{type(error).__name__}），本轮已安全停止。"
                     stop_reason = "non_retryable_error"
-                    halt_remaining_calls = True
 
             if status == "error":
                 content, artifact = limit_tool_result(content)
@@ -550,11 +543,15 @@ def build_agent_graph(
     graph = StateGraph(AgentState)
     graph.add_node("context", prepare_context_node)
     graph.add_node("model", call_model_node)
+    graph.add_node("review", review_tools_node)  # 审查单独持久化，工具节点重入时不重复调用子 Agent。
     graph.add_node("tools", execute_tools_node)
 
     graph.add_edge(START, "context")
     graph.add_edge("context", "model")
-    graph.add_conditional_edges("model", route_after_model, {"tools": "tools", END: END})
+    graph.add_conditional_edges("model", route_after_model, {"tools": "review", END: END})
+    graph.add_edge("review", "tools")
     graph.add_conditional_edges("tools", route_after_tools, {"context": "context", END: END})
 
-    return graph.compile(checkpointer=checkpointer, name="common_agent")
+    return graph.compile(checkpointer=checkpointer, name="common_agent").with_config(
+        {"recursion_limit": MAX_TOOL_ROUNDS * 4 + 10},  # 每轮现在经过四个节点，框架步数不能早于工具轮数保险丝耗尽。
+    )

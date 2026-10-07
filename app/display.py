@@ -69,6 +69,10 @@ def print_progress_event(event: dict) -> None:
         print(f"[服务补试] {event['name']}：第 {event['attempt']} 次，等待 {event['delay']} 秒", flush=True)
     elif kind == "tool_result":
         print_tool_result(event["message"])  # 成功、失败和被拒绝的工具结果都走这里。
+    elif kind == "review_start":
+        print(f"[安全审查] {event['name']}：独立子 Agent 开始审查。", flush=True)
+    elif kind == "review_result":
+        print(f"[审查决定] {event['name']}：{event['permission']}", flush=True)  # 显示决定，不把子 Agent 的取证正文打印成用户回答。
 
 
 def print_turn_end(result: dict, old_message_count: int, answer_streamed: bool, max_tool_rounds: int) -> None:

@@ -4,16 +4,18 @@
 
 - 真实模型：通过 OpenAI 兼容协议调用 `.env` 中配置的模型；当前是千问。
 - 真实工具循环：模型自己选择工具，工具真的读取或新建本地文件，再把结果交还模型。
-- 工具治理登记：按来源和工具名明确配置 allow/ask/deny 权限；未配置的新工具默认 ask，模型可发现，执行前必须人工确认。
+- 工具治理登记：固定 allow / ask；未定级为 None，交给隔离的安全子 Agent 逐次决定 allow / ask / deny。服务不可用时退回 ask，路径等代码校验不变。
 - 工具数据隔离：workspace、RAG、MCP 的真实返回统一标记为不可信数据，不能获得指令权限。
 - 文件化运行规则：启动时读取 `prompts/AGENTS.md`，编辑规则无需修改 Python，重启后生效。
 - Skill 渐进式加载：系统提示只带名称和用途，`skill_view(name)` 按需读取项目维护的任务指南，仍受用户要求和工具权限约束。
 - 分层长期记忆：`user.md` 画像与 `memory.md` 索引常驻；动态主题按需读取，新建和更新经过人工批准。
 - 真实 RAG：文档切块与向量入库；SQLite 关键词检索和向量检索双路召回，RRF 融合后由百炼 `qwen3-rerank` 重排，返回原文与 source。
-- 真实 MCP：官方 MCP Python SDK 2.2.0；Client 通过 stdio 启动独立 Server，动态发现 Schema 并调用工具。
+- 真实 MCP：官方 Python SDK 远程 Streamable HTTP 客户端；配置驱动工具发现、筛选和调用，不自建服务器。
 - 真实持久化：LangGraph checkpoint 写入 SQLite，同一 `thread_id` 重启后仍能续聊。
 - 上下文预算：工具单条结果限长；历史接近预算时滚动摘要旧消息，原始 checkpoint 仍保留。
 - 真实安全边界：普通文件工具限定 `workspace`；Skill 只读已登记指南；长期记忆工具限定 `memory/`，新建和更新都需批准。
+- 文件增删改查：新增 `delete_file`，只删除 workspace 单个文件、必须审批、不进入回收站。
+- PowerShell 能力兜底：`execute_command(command, description)`，独立安全子 Agent 审查权限；需要审批时展示中文说明和原始命令。仅适合可信用户本机使用，没有沙箱隔离。
 - 真实交互入口：既能在 PyCharm 运行，也能在 PowerShell 连续聊天。
 - 真实交互链路：可以直接体验“模型 → 工具 → 模型”和 SQLite 会话续聊。
 - 联网搜索：`web_search` 调用千问 Responses API，搜索与网页提取对外合成一个工具；查询需人工确认，结果带来源并按外部数据隔离。
@@ -22,6 +24,7 @@
 - CLI 流式：`ChatOpenAI(streaming=True)` 让模型正文分块到达 `messages` 流并即时显示；`custom` 流实时报告工具开始和服务补试，审批与最终 checkpoint 保持原机制。
 
 当前内核暂不包含数据分析、多智能体、复杂规划或自主执行；是否增加这些能力，后续按真实需求逐项决定。
+Shell 的免审批判断依赖模型，可能出错；关键词名单也不完整，不能保证拦截所有危险命令。默认 cwd 为 workspace 不限制绝对路径、网络或系统访问。
 RAG 和 MCP 已作为当前内核的标准接入能力，提供真实、最小、完整的参考实现。
 
 ## 1. 整体执行流程
@@ -76,7 +79,7 @@ app/manual_loop.py 手写的图（唯一引擎）
                  │                              │
                  ├─ workspace 受限文件工具       │
                  ├─ RAG 向量知识检索             │
-                 └─ MCP stdio 外部工具           │
+                 └─ MCP 远程外部工具             │
                          │                       │
                          └─ 真实结果回到模型 ─────┤
                                                 ▼
@@ -87,14 +90,14 @@ app/manual_loop.py 手写的图（唯一引擎）
 
 这里最关键的不是“调用了一次大模型”，而是形成了闭环：模型能观察工具结果，再决定继续调用工具还是回答。
 
-工具治理采用三档 `allow / ask / deny`，并已经接入工具节点的真实分发：`allow` 才进入 `tool.ainvoke`，`ask` 通过 LangGraph `interrupt` 暂停，CLI 用 `Command(resume=...)` 恢复后才执行，`deny` 直接拒绝。后续 M7 只继续补取消、幂等和更复杂的审批恢复，不重复实现这条最小 HITL 链路。
+登记表只固定 `allow / ask`，其余工具策略为 `None`，先进入安全子 Agent；最终执行决策是 `allow / ask / deny`。`ask` 仍由主 Agent 的 `interrupt` 暂停，CLI 用 `Command(resume=...)` 恢复；子 Agent 不审批、不执行待审工具。审查节点先保存当前批次决定，审批恢复不会重复取证；任何一次拒绝都会使同批工具不执行。
 
 ## 2. 为什么手写主循环
 
-`app/manual_loop.py` 有三个职责清楚的节点：上下文、模型、工具。模型升级复用工具节点，不新建第二套循环。
+`app/manual_loop.py` 有四个职责清楚的节点：上下文、模型、审查、工具。模型升级复用工具节点，不新建第二套循环。
 
 ```text
-START ──> [context] ──> [model] ──有 tool_calls──> [tools]
+START ──> [context] ──> [model] ──有 tool_calls──> [review] ──> [tools]
               ▲              │                         │
               │              │ 无 tool_calls            │ 可继续
               │              ▼                         │
@@ -144,8 +147,8 @@ token 计数是保守估算，工具预览的 20000 则是字符数，两者不�
 连首次调用最多四次，不重复请求模型或人工审批；耗尽后安全停止。
 权限拒绝独立处理；用户拒绝人工确认后，
 模型会得到一次不带工具的回答机会，解释操作没有执行。
-MCP Server 正常返回的工具错误属于有限改参重试。连接关闭或超时只有在请求尚未发出，
-或工具属于本地 Server 的无写入副作用白名单时才原地补试；其他故障安全停止。
+MCP Server 正常返回的工具错误属于有限改参重试。连接关闭或超时只有在请求尚未发出时
+才原地补试；请求发出后结果不明则安全停止，不擅自重复远端操作。
 
 官方资料：
 
@@ -212,9 +215,9 @@ common_agent/
 │  └─ knowledge-answer/SKILL.md # 知识库检索与来源引用
 ├─ app/
 │  ├─ config.py              # 路径、.env、模型配置
-│  ├─ workspace_tools.py     # 四个真实工具与安全边界
+│  ├─ workspace_tools.py     # 列目录、读文件、搜索、新建和编辑，统一工作区边界
 │  ├─ rag_tools.py           # 切块、真实 Embedding、SQLite 向量检索
-│  ├─ mcp_bridge.py          # MCP 动态发现到 LangChain 工具的桥
+│  ├─ mcp_client.py          # 远程 MCP 连接、工具筛选与 LangChain 接线
 │  ├─ tool_registry.py       # 工具契约、来源和权限登记表
 │  ├─ tool_errors.py         # 可重试/不可重试的工具失败约定
 │  ├─ skills.py              # Skill 目录发现、元数据与按名称读取
@@ -223,8 +226,7 @@ common_agent/
 │  ├─ agent.py               # 运行规则 + Skill 清单 + 模型/工具组装
 │  ├─ display.py             # 把执行轨迹显示给人
 │  └─ cli.py                 # 异步多轮命令行产品入口
-├─ mcp_servers/
-│  └─ common_tools_server.py # 真正独立的 MCP 2.x stdio Server
+├─ mcp.json                  # 远程服务地址、可选 headers 与工具名称列表
 ├─ workspace/
 │  ├─ notes/                 # Agent 运行中自己生成的文件（不提交）
 │  └─ knowledge/             # RAG 文档目录
@@ -240,7 +242,7 @@ common_agent/
 
 1. `config.py` → `workspace_tools.py`：先复习配置和普通工具。
 2. `rag_tools.py`：看清完整 RAG 数据链路。
-3. `common_tools_server.py` → `mcp_bridge.py`：看清 MCP 的两个进程。
+3. `mcp.json` → `mcp_client.py`：看清远程工具发现与调用。
 4. `skills.py` → `tool_registry.py` → `agent.py`：理解规则、Skill 清单和工具如何汇入同一个 Agent。
 5. `cli.py`：理解外层如何启动和持续运行会话。
 
@@ -292,6 +294,45 @@ PowerShell：
 
 再让它列目录或读取该文件，就能看到真实落盘结果。再次用同名文件写入会被拒绝，不会悄悄覆盖。
 
+修改已有文件使用 `edit_text_file(relative_path, old_text, new_text)`：先读原文，旧文本必须精确且唯一匹配；匹配不到或匹配多处时拒绝，模型应补充上下文再提交。`new_text=""` 可删除选中的那一段。编辑先经过独立权限审查，需要人工确认时批准后才写盘；先写同目录临时文件，再原子替换，保留未修改的 UTF-8 BOM 与换行格式。限制文件不超过 1 MB、修改后不超过 10 万字符，不做模糊替换或全局替换。
+
+删除整个文件使用 `delete_file(relative_path)`：必须人工确认，允许工作区内任意后缀的单个文件，不递归删除目录，删除不进入回收站。
+
+没有专用工具覆盖时使用 `execute_command`。固定调用 Windows 自带 `powershell.exe`，不加载用户 profile，关闭交互输入；每次独立进程，从 workspace 启动。命令等待上限 100 秒，超时/取消尝试 taskkill 清理进程树，外层仍有 120 秒总兜底。stdout/stderr 写临时文件，有限读取后走通用结果截断和不可信数据包装；命令失败不自动补试，退出码非零或超时应先检查是否有部分副作用。没有持久终端、沙箱或完整命令解析器。
+
+Shell 不再接收主模型自报的 `needs_approval`，也不再维护危险词表；未定级调用由安全子 Agent 看真实契约和参数。批准界面仍显示模型中文说明、真实命令和工作目录；说明不保证准确。独立模型审查是风险判断，不是操作系统级安全隔离。
+
+### 安全子 Agent：只读取证与独立决策
+
+2026-10-05 顺序调整：Jev 先判断，uncertain 才取证。新顺序的 9 项本地分支检查通过；下述真实 API 样例验证的是此前先取证版本，新顺序尚未重新跑真实端到端验收。
+
+实现位于 `app/safety_agent.py`。主图固定 `allow` 的读工具直接执行，固定 `ask` 的 `delete_file` 必须人工批准。文件写入、记忆更新、索引构建、Shell、远端 MCP 和联网工具未定级，逐次审查，不永久修改登记表。
+
+```text
+主模型申请一批工具
+  → 固定 allow / ask 直接采用；None 调用各自启动安全子 Agent
+  → asyncio.gather 并发收集审查决定 → review 节点保存 checkpoint
+  → 主 Agent 统一人工确认（仅 ask）→ 按原顺序执行真实工具
+
+独立审批偏好 + 当前用户诉求 + 待审工具契约和参数
+  → Jev Choice 先判断（第一次证据列表为空）
+      allow 且概率 > 0.85 → allow；低概率 allow → ask
+      ask / deny → 返回决定
+      uncertain → 千问检索内部工具知识、按需读文件 → 再交给 Jev
+                  uncertain 时可继续只读取证，整次审查最多 120 秒；未尝试检索则 ask
+  → 最多十次 Jev；仍不确定、服务出错或总等待超 120 秒 → ask
+```
+
+每个子任务有独立消息与证据列表，不读取父对话历史，不继承主 Agent 的长期记忆，只读取维护者单独编辑的 `memory/safety/user.md`；文件不存在时按无偏好处理。普通记忆工具不能修改这个路径。取证工具仅为 `read_text_file` 和 `search_knowledge_base`，不联网、不写文件、不审批。中间证据不回灌父消息，只保存本批次调用 ID 对应的最终决定；CLI 仅显示开始与决定，不把取证输出当用户回答。
+
+在 `.env` 中填写 `OPENROUTER_API_KEY`，模型默认使用 `typesafe/jev-1.13`，也可通过 `JEV_MODEL` 指定其他 Jev 型号。Jev 经 OpenRouter 的 [Decisions API](https://openrouter.ai/api/alpha/decisions) 调用，不是 Chat Completions。只有选中 `allow` 且 `probabilities.allow > 0.85` 才自动放行；低概率或缺失/非法概率直接 `ask`，不继续取证。这里检查选项概率，不是总体 `confidence`；门槛不代表安全正确率。千问使用正常工具选择，由提示词要求检索，不强制设置 `tool_choice`，保留思考模式；本轮未尝试检索时退回人工确认。未填密钥直接退回人工确认，不空跑千问。**配置前需确认待审工具参数、当前用户诉求、权限偏好和只读取证结果可发送给 OpenRouter。** 本地桩模型与真实 SQLite 验证通过；2026-10-05 本机真实只读取证 → Jev 决策链路通过（两次 RAG、一次读文件，allow 概率 0.98），未执行待审 Shell；安全质量和复杂样本仍留到评测。
+
+`memory/` 不进入 Git，新电脑需自行创建审批偏好文件。可写：只读且不涉及敏感数据的操作可自动运行；删除、覆盖、安装、未知脚本及 workspace 外操作需要确认；资料不足先取证、仍不确定请人判断。偏好不替代代码路径校验；Shell 仍无沙箱。
+
+```text
+请把 notes/first_note.md 中的“我们完成了真实工具调用”改成“我们完成了真实工具调用与文件编辑”。
+```
+
 体验 RAG：
 
 ```text
@@ -306,10 +347,16 @@ PowerShell：
 体验 MCP：
 
 ```text
-请使用 MCP 工具准确计算 37+58，并读取 MCP Server 所在电脑的当前时间。
+请使用高德 MCP 查询杭州天气。
 ```
 
-你会在终端轨迹中看到 `add_numbers` 与 `get_current_time`。它们来自独立 Server 进程，不是 Agent 内部假装调用。
+在高德开放平台创建 Web 服务 Key，写入本机 `.env` 的 `AMAP_API_KEY`，不要提交真实密钥。`mcp.json` 使用 `${AMAP_API_KEY}` 引用它，启动时在内存替换；可选 `headers` 也支持此形式。
+
+`mcpServers` 按服务名配置远程地址。`tools` 是允许接入的原始工具名称列表：不写则加载全部，空列表跳过服务，名称拼错则启动报错。仅开放 6 个工具：地点搜索（关键词/名称＋城市）、天气，以及驾车、步行、骑行、公交路线规划。改配置后重启，不做热加载、stdio 或 OAuth。`mcpServers` 设为空对象可以禁用 MCP。
+
+模型工具名统一为 `服务名__工具名`（例如 `amap__maps_weather`），避免不同服务重名；远端调用使用原始名称。清单只是能力筛选，不是执行授权：全部 MCP 工具仍未定级，经过现有安全子 Agent 与必要的人工确认，成功结果仍套不可信来源包装。
+
+发现和调用共用 URL/鉴权配置；每次结束关闭 Client/HTTP 连接，不关闭第三方服务器。请求发出后连接故障不自动补试，以免重复远端操作。2026-10-05 重构时，高德真实握手、15 个工具发现及原清单四种工具调用通过；另通过真实主模型 → 人工审批恢复 → 天气工具 → 最终回答的 CLI 链路（此项将安全决策替换为 ask，不代表 Jev 验收）。随后按用户要求改为上述 6 个工具，本地筛选验证通过，新增的步行、骑行、公交路线尚未真实调用。本地 demo Server 已删除，不再展示双传输能力。
 
 ## 6. 会话与记忆
 
@@ -343,10 +390,10 @@ memory/                   # 本机私人数据，整个目录不提交 Git
 | 工具 | 作用 | 权限 |
 |---|---|---|
 | memory_read(relative_path) | 完整读取画像、索引或某个主题 | allow |
-| create_memory(relative_path, content) | 新建画像或动态主题，不覆盖 | ask |
-| update_memory(relative_path, old_text, new_text) | 精确替换唯一旧文本，保留其余内容 | ask |
+| create_memory(relative_path, content) | 新建画像或动态主题，不覆盖 | 子 Agent 逐次审查 |
+| update_memory(relative_path, old_text, new_text) | 精确替换唯一旧文本，保留其余内容 | 子 Agent 逐次审查 |
 
-写入前审批会展示路径及内容；更新会展示 old_text 和 new_text。
+若审查结果为 ask，写入前审批展示路径及内容；更新展示 old_text 和 new_text。
 更新前先读取文件；旧文本缺失或重复就要求重新读取，避免盲目覆盖。
 主题格式为 `# 标题`、空行、单行说明、空行、正文；标题最多 80 字符，说明最多 160 字符。
 例如 `topics/project-stack.md`：
@@ -387,9 +434,10 @@ memory/                   # 本机私人数据，整个目录不提交 Git
 - 普通文件读取按页限长，单次写入最大 10 万字符；完整 Skill 文件最多 20000 字符。
 - 搜索最多返回 50 条，列目录最多展示 200 项，防止上下文无限膨胀。
 - 普通文件工具只允许 workspace 内路径；skill_view 只能读取已登记、解析后仍在 skills 目录内的 SKILL.md。
-- 只能新建，不能覆盖、删除或运行 shell 命令。
+- 新建拒绝覆盖；编辑只替换唯一匹配的文本；删除单个文件固定审批。写入和 Shell 经独立子 Agent 审查，需要确认时由主 Agent 统一询问。
+- 安全子 Agent 的模型判断不是沙箱；Shell 可访问当前 Windows 用户有权限访问的资源，仅用于可信用户本机。普通工具的路径、类型、大小校验不因模型允许而跳过。
 - RAG 索引只读取 workspace 中大小合规的 md/txt/json/csv；检索结果被当作不可信证据，不当作系统指令。
-- MCP Server 不接收 `.env` 或 API Key，只暴露显式注册的两个工具；stdio 生命周期由 Client 管理。
+- MCP 连接目标由维护者在 mcp.json 配置，不接受模型传入连接地址；密钥留在 .env，工具元数据不保存含密钥的 URL。第三方会接收工具参数，执行前仍进行权限审查。
 - `.env` 和 SQLite 已加入 `.gitignore`。
 
 这是内核的能力边界，不是缺陷：Agent 的工具权限必须按真实需求逐项开放，不能一开始就把整台电脑交给模型。
@@ -405,14 +453,14 @@ memory/                   # 本机私人数据，整个目录不提交 Git
 ## 10. 一个重要的版本事实
 
 当前官方 `mcp` Python SDK 已是 2.2.0，而 `langchain-mcp-adapters` 0.3.2 仍声明依赖 `mcp>=1.24,<2`。
-本项目没有偷偷降级到 1.x，而是直接使用官方 2.2 `MCPServer` 和 `Client`，自己实现约 100 行透明桥接：
+本项目直接使用官方 2.2 `Client` 和 Streamable HTTP 传输，保留一层透明的客户端适配：
 
-1. Client 通过 stdio 启动 Server；
+1. 从 mcp.json 读取远程服务地址、鉴权头与工具列表；
 2. `list_tools()` 动态获取名称、说明和 JSON Schema；
-3. Schema 原样变成 LangChain `StructuredTool`；
+3. 筛选并加服务名前缀，Schema 原样变成 LangChain `StructuredTool`；
 4. Agent 异步调用时，再由 Client 真正执行 MCP 工具。
 
-等官方适配器支持 MCP 2.x 后，可以替换 `mcp_bridge.py`，其他模块和 MCP Server 不必重写。
+实现集中在 `mcp_client.py`，不自建 MCP Server，不新增 Manager 或插件工厂。
 
 ## 11. RAG 的真实边界
 

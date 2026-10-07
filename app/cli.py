@@ -16,6 +16,7 @@ from app.config import (
     DATABASE_PATH,
     load_model_settings,
     prepare_runtime_directories,
+    WORKSPACE_ROOT,
 )
 from app.display import print_answer_chunk, print_model_update, print_progress_event, print_turn_end
 from app.sessions import completed_turns, fork_turn, print_turns  # CLI 的 /time 与 /fork 命令复用这里的历史查询和分叉函数。
@@ -49,7 +50,7 @@ def print_help() -> None:
   请列出工作区文件。
   请在 notes 目录新建 first_note.md，内容是“我们完成了真实工具调用”。
   请为 knowledge 建立索引，再检索 RAG 验证暗号并附来源。
-  请使用 MCP 工具计算 37+58，并读取当前时间。
+  请使用高德 MCP 查询杭州天气。
 """.strip()
     )
 
@@ -97,7 +98,13 @@ async def invoke_with_human_approval(agent, user_input: str, config: dict) -> di
         print(request.get("message", "Agent 请求执行受保护工具。"))
         for item in request.get("tools", []):
             print(f"  工具：{item['name']}")
-            print(f"  参数：{item.get('args', {})}")
+            arguments = item.get("args", {})
+            if item["name"] == "execute_command":
+                print(f"  准备做什么（模型说明）：{arguments.get('description', '')}")
+                print(f"  执行目录：{WORKSPACE_ROOT}")
+                print(f"  原始命令：{arguments.get('command', '')}")  # 不能仅显示模型解释，用户应能核对真实命令。
+            else:
+                print(f"  参数：{arguments}")
 
         answer = input("是否批准执行？输入 y 批准，其他任何内容都拒绝：").strip().lower()
         approved = answer in {"y", "yes", "是", "同意"}
@@ -119,7 +126,8 @@ async def main_async() -> None:
     print("=" * 62)
     print("common_agent v1.0：真实模型 + 文件工具 + 向量 RAG + MCP + SQLite")
     print(f"模型：默认 {fast_settings['model']}，必要时单向升级为 {strong_settings['model']}")
-    print("安全边界：普通文件工具限定 workspace；记忆工具限定 memory，写入和更新需批准。")
+    print("权限：固定 allow / ask，未定级调用由安全子 Agent 审查；人工确认仍在主 Agent。")
+    print("Shell 没有沙箱：子 Agent 的判断不是强隔离，仅供可信用户本机使用。")
     print("=" * 62)
 
     raw_thread_id = input("会话编号（直接回车使用 common-demo）：")

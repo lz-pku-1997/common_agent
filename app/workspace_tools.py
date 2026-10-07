@@ -1,10 +1,12 @@
 """common_agent 的真实文件工具。
 
-这里没有模拟数据：模型调用工具后，工具会真的读取或新建 workspace 里的文件。
+这里没有模拟数据：模型调用工具后，工具会真的读取、新建或修改 workspace 里的文件。
 同时它也不是一个“能碰整台电脑”的文件助手。所有路径都必须留在 workspace 内，
 这是 Agent 工具最重要的安全边界之一。
 """
 
+import os
+import tempfile
 from pathlib import Path
 
 from langchain.tools import tool
@@ -192,10 +194,62 @@ def save_new_text_file(relative_path: str, content: str) -> str:
     return f"已真实新建文件：{relative_name}（{len(content)} 个字符）"
 
 
+@tool
+def edit_text_file(relative_path: str, old_text: str, new_text: str) -> str:
+    """修改 workspace 已有 UTF-8 文本文件：将唯一匹配的 old_text 替换为 new_text。
+
+    先读取原文件，old_text 必须与原文精确一致，不能为空。匹配多处时补充上下文，
+    不会全部替换。new_text 为空表示删除这段文字；本工具不创建新文件。
+    """
+    path = resolve_workspace_path(relative_path)  # 编辑与读取共用工作区边界，禁止越界路径和符号链接。
+    ensure_supported_text_file(path)
+    if not path.is_file():
+        raise FixableError(f"文件不存在或不是文件：{relative_path}")
+    if not old_text:
+        raise FixableError("old_text 不能为空，请先读取文件并提供要替换的原文。")
+    if path.stat().st_size > MAX_READ_BYTES:
+        raise FixableError("文件超过 1 MB，不支持整份读取后编辑。")
+    original = path.read_bytes()  # 使用字节读取，避免 Windows 自动改变 CRLF 换行或去掉 BOM。
+    try:
+        content = original.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise FixableError("编辑工具只支持 UTF-8 文本文件。") from error
+    matches = content.count(old_text)  # 只允许一个精确匹配，不猜测模型想改哪一处。
+    if matches != 1:
+        raise FixableError(f"old_text 匹配 {matches} 处，必须恰好一处；请重新读取并补充定位上下文。")
+    updated = content.replace(old_text, new_text, 1)
+    if len(updated) > MAX_WRITE_CHARACTERS:
+        raise FixableError("修改后超过 10 万字符，拒绝写入。")
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as file:  # 同目录临时文件，先写完再切换。
+            temporary_path = Path(file.name)
+            file.write(updated.encode("utf-8"))  # 原文未替换的换行、BOM 和文字保持原样。
+        if path.read_bytes() != original:
+            raise FixableError("文件在编辑期间已变化，请重新读取后再修改。")
+        os.replace(temporary_path, path)  # 原子替换，写临时文件失败不会破坏原文件。
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)  # 成功后临时文件已移走；失败时清理残留。
+    return f"已真实修改文件：{path.relative_to(WORKSPACE_ROOT).as_posix()}（替换 1 处）"
+
+
+@tool
+def delete_file(relative_path: str) -> str:
+    """删除 workspace 内的单个文件，执行前必须人工批准；不删除目录，不进入回收站。"""
+    path = resolve_workspace_path(relative_path)  # 与其他文件工具共用路径边界，越界目标不能删除。
+    if not path.is_file():
+        raise FixableError(f"文件不存在或不是文件：{relative_path}")
+    path.unlink()  # 只删除一个文件；不使用递归删除，不限制文件后缀。
+    return f"已删除文件：{path.relative_to(WORKSPACE_ROOT).as_posix()}（未进入回收站）"
+
+
 # Agent 只会看见这个列表里的工具。以后增加能力时，在这里显式注册，便于审查边界。
 WORKSPACE_TOOLS = [
     list_workspace_files,
     read_text_file,
     search_workspace_text,
     save_new_text_file,
+    edit_text_file,
+    delete_file,
 ]
