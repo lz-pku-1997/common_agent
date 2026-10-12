@@ -6,6 +6,10 @@ r"""common_agent 的真实命令行界面。
 
 import re
 import asyncio
+import os
+
+from langfuse import get_client
+from langfuse.langchain import CallbackHandler
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
@@ -118,7 +122,7 @@ async def invoke_with_human_approval(agent, user_input: str, config: dict) -> di
     return result
 
 
-async def main_async() -> None:
+async def main_async(langfuse_handler: CallbackHandler | None = None) -> None:
     prepare_runtime_directories()
     fast_settings = load_model_settings("fast")
     strong_settings = load_model_settings("strong")
@@ -170,6 +174,9 @@ async def main_async() -> None:
                 continue
 
             config = {"configurable": {"thread_id": thread_id}}
+            if langfuse_handler is not None:
+                config["callbacks"] = [langfuse_handler]  # 官方回调记录图节点、模型和工具调用。
+                config["metadata"] = {"langfuse_session_id": thread_id}  # 同一会话的记录在面板里归为一组。
             parts = user_text.split()
             if parts[0] in {"/time", "/fork"}:
                 try:
@@ -201,7 +208,15 @@ async def main_async() -> None:
 def main() -> None:
     """同步启动壳：帮普通 Python 文件启动并管理 asyncio 事件循环。"""
 
-    asyncio.run(main_async())
+    handler = None
+    if os.getenv("LANGFUSE_TRACING_ENABLED", "false").strip().lower() == "true":
+        handler = CallbackHandler()  # 明确开启后才创建；SDK 从环境变量读取密钥。
+        handler.run_inline = True  # 在当前异步上下文建立父 span，让手动 Jev 记录能继承它。
+    try:
+        asyncio.run(main_async(handler))
+    finally:
+        if handler is not None:
+            get_client().shutdown()  # CLI 退出前发送完后台队列里的记录。
 
 
 if __name__ == "__main__":

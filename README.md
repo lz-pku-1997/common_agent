@@ -22,6 +22,7 @@
 - 单向模型交接：会话默认 Flash，棘手任务通过 upgrade_to_strong 升级 Max；沿用原循环和历史，此后不降档。
 - 会话分叉：`/time` 查看已完成轮次；从历史轮次开新分支，只复制对话状态，不回滚现实操作。
 - CLI 流式：`ChatOpenAI(streaming=True)` 让模型正文分块到达 `messages` 流并即时显示；`custom` 流实时报告工具开始和服务补试，审批与最终 checkpoint 保持原机制。
+- Langfuse 接线：配置密钥并将 `LANGFUSE_TRACING_ENABLED=true` 后，CLI 通过官方 Callback 记录图节点、模型和工具调用，按会话编号分组；输入输出上传云端，默认关闭。Jev 额外记录 `jev_permission` generation（模型调用 observation）：模型名、工具调用 ID、判断轮次、证据条数、选项概率和门槛后的权限；不额外记录参数、偏好或证据正文。它挂在当前 review 下，独立评测不另建孤立 trace；补试与审批细节尚未补充。
 
 当前内核暂不包含数据分析、多智能体、复杂规划或自主执行；是否增加这些能力，后续按真实需求逐项决定。
 Shell 的免审批判断依赖模型，可能出错；关键词名单也不完整，不能保证拦截所有危险命令。默认 cwd 为 workspace 不限制绝对路径、网络或系统访问。
@@ -65,7 +66,7 @@ Flash 判断当前任务难以可靠完成时，调用 upgrade_to_strong(reason)
 流式入口使用 `messages`（回答片段）、`updates`（工具结果／审批断点）和 `custom`
 （模型升级／工具开始／服务补试）三种 LangGraph 流。只打印 model 节点的正文，不展示 context 摘要或思考块。
 审批恢复仍传 `Command(resume={"approved": bool})`，不产生第二次写入；最终 State 从 SQLite 读取。
-停止时使用本轮专属说明，不把上一轮答案冒充本轮成功。Tracing 与评测本轮没有开发。
+停止时使用本轮专属说明，不把上一轮答案冒充本轮成功。Tracing 已接入 Langfuse；评测入口与边界见下文“评测”。
 
 ```text
 用户在 CLI 输入问题
@@ -320,12 +321,12 @@ Shell 不再接收主模型自报的 `needs_approval`，也不再维护危险词
       ask / deny → 返回决定
       uncertain → 千问检索内部工具知识、按需读文件 → 再交给 Jev
                   uncertain 时可继续只读取证，整次审查最多 120 秒；未尝试检索则 ask
-  → 最多十次 Jev；仍不确定、服务出错或总等待超 120 秒 → ask
+  → 最多四次 Jev；仍不确定、服务出错或总等待超 120 秒 → ask
 ```
 
 每个子任务有独立消息与证据列表，不读取父对话历史，不继承主 Agent 的长期记忆，只读取维护者单独编辑的 `memory/safety/user.md`；文件不存在时按无偏好处理。普通记忆工具不能修改这个路径。取证工具仅为 `read_text_file` 和 `search_knowledge_base`，不联网、不写文件、不审批。中间证据不回灌父消息，只保存本批次调用 ID 对应的最终决定；CLI 仅显示开始与决定，不把取证输出当用户回答。
 
-在 `.env` 中填写 `OPENROUTER_API_KEY`，模型默认使用 `typesafe/jev-1.13`，也可通过 `JEV_MODEL` 指定其他 Jev 型号。Jev 经 OpenRouter 的 [Decisions API](https://openrouter.ai/api/alpha/decisions) 调用，不是 Chat Completions。只有选中 `allow` 且 `probabilities.allow > 0.85` 才自动放行；低概率或缺失/非法概率直接 `ask`，不继续取证。这里检查选项概率，不是总体 `confidence`；门槛不代表安全正确率。千问使用正常工具选择，由提示词要求检索，不强制设置 `tool_choice`，保留思考模式；本轮未尝试检索时退回人工确认。未填密钥直接退回人工确认，不空跑千问。**配置前需确认待审工具参数、当前用户诉求、权限偏好和只读取证结果可发送给 OpenRouter。** 本地桩模型与真实 SQLite 验证通过；2026-10-05 本机真实只读取证 → Jev 决策链路通过（两次 RAG、一次读文件，allow 概率 0.98），未执行待审 Shell；安全质量和复杂样本仍留到评测。
+在 `.env` 中填写 `OPENROUTER_API_KEY`，模型默认使用 `typesafe/jev-1.13`，也可通过 `JEV_MODEL` 指定其他 Jev 型号。Jev 经 OpenRouter 的 [Decisions API](https://openrouter.ai/api/alpha/decisions) 调用，不是 Chat Completions。只有选中 `allow` 且 `probabilities.allow > 0.85` 才自动放行；低概率或缺失/非法概率直接 `ask`，不继续取证。这里检查选项概率，不是总体 `confidence`；门槛不代表安全正确率。千问使用正常工具选择，由提示词要求检索，不强制设置 `tool_choice`，保留思考模式；本轮未尝试检索时退回人工确认。未填密钥直接退回人工确认，不空跑千问。**配置前需确认待审工具参数、当前用户诉求、权限偏好和只读取证结果可发送给 OpenRouter。** 本地桩模型与真实 SQLite 验证通过；2026-10-05 本机真实只读取证 → Jev 决策链路通过（两次 RAG、一次读文件，allow 概率 0.98），未执行待审 Shell。真实安全判断质量由 `evals/safety.py` 测：2026-10-13 首轮 8 个标注场景全部判对（含同请求不同审批偏好的 allow/ask 对照和危险参数边界），接口错误 0；样本量小，只说明该轮判断与人工标注一致，不代表真实环境安全率。
 
 `memory/` 不进入 Git，新电脑需自行创建审批偏好文件。可写：只读且不涉及敏感数据的操作可自动运行；删除、覆盖、安装、未知脚本及 workspace 外操作需要确认；资料不足先取证、仍不确定请人判断。偏好不替代代码路径校验；Shell 仍无沙箱。
 
@@ -417,10 +418,21 @@ memory/                   # 本机私人数据，整个目录不提交 Git
 模型根据常驻索引选择主题，再通过 memory_read 按需读取正文；主题正文不再同步进知识库 RAG。
 这一目录属于 common_agent 产品，与桌面的 common_memory 助手协作记忆无关。
 
-## 7. 当前学习主线
+## 7. 四类评测
+
+统一按评测类型组织在 `evals/`：任务结果、工具调用与轨迹、权限安全、回答质量 / LLM-as-judge。四个主文件只包含真实评测，不使用 DeepEval。结果与轨迹共享八个真实 Agent 任务；Jev 8 个标注场景（四类标签各 2 条，含审批偏好对照和危险参数边界）；回答质量另有 4 道独立任务，真实 Agent 使用现有文件工具完成资料汇总、保存简报、修改说明和重名失败解释，由 DeepSeek 按 correctness（事实正确性）、completeness（回答完整性）、coherence（表达连贯性）各打0/1/2分，每题满分6分。合计 20 个独立场景。
+
+```powershell
+.\.venv\Scripts\python.exe -m evals.run_all
+.\.venv\Scripts\python.exe -m evals.run_all --categories safety answer_quality
+```
+
+每个样例运行一次；代码检查保留供开发时单独运行，评测入口不运行或汇总它们。真实调用会产生费用、向配置的供应商发送合成样例与必要运行规则，运行前确认数据可外发。汇总和各类 JSON/Markdown 统一保存到 `evals/reports/<run-id>/`；原始输出、文件状态、错例和接口错误均保留。2026-10-13 首次全量运行四类全绿：任务结果 6/6（失败题文件未变 2/2）、轨迹 8/8、安全 8/8、回答质量四题均 6/6；全绿只对应该轮样本。模型裁判不是客观真值，不合成总分。详细判据、隔离方式和阅读顺序见 [评测说明](evals/README.md)。
+
+## 8. 当前学习主线
 
 当前只沿着产品主线阅读和开发：配置 → 工作区工具 → RAG → MCP → Agent 组装 → CLI 会话。
-当前主线不包含评测/eval 目录和验收脚本；等核心能力完成后另行设计，不要在现在的阅读过程中寻找它们。
+评测统一放在 `evals/`，按四类主文件阅读；辅助验证代码与评测主流程分开存放。
 
 主循环现在会记录本轮上一次“工具名 + 参数”的调用签名。如果模型连续发出完全相同的工具请求，
 系统会把“已重复、停止继续调用”作为工具结果写回 State，并安全结束本轮，避免无意义地消耗额度或重复产生副作用。

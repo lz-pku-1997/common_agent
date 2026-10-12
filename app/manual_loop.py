@@ -303,6 +303,7 @@ def build_agent_graph(
             if schema is not None and not isinstance(schema, dict):
                 schema = schema.model_json_schema()  # Python 工具和 MCP 工具都传实际参数契约。
             request = {
+                "tool_call_id": call["id"],  # 标识同一批的具体待审调用，便于并发 Jev 记录对照。
                 "tool": tool.name, "description": tool.description, "schema": schema,
                 "source": policy.source, "arguments": call.get("args", {}), "user_request": user_request,
             }

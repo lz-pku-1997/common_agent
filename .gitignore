@@ -12,6 +12,14 @@ memory/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-tmp/
+
+# 本地自动化测试与检索诊断（含专用语料），仅供本机验证，不提交。
+/tests/
+
+# 评测运行报告可能包含真实模型输出与用量，只保存在本机，审阅后再决定是否分享。
+reports/evals/
+evals/reports/
 
 # SQLite 会保存真实对话，不应提交到代码仓库。
 data/*.sqlite

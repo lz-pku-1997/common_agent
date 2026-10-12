@@ -3,8 +3,11 @@
 import asyncio
 import json
 import os
+from contextlib import nullcontext
 
 import httpx
+from langfuse import get_client
+from opentelemetry.trace import get_current_span
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from app.config import MEMORY_ROOT, MAX_TOOL_RESULT_CHARS
@@ -13,6 +16,7 @@ from app.config import MEMORY_ROOT, MAX_TOOL_RESULT_CHARS
 SAFETY_USER_PATH = MEMORY_ROOT / "safety" / "user.md"  # 独立审批偏好，不读取主 Agent 的画像或主题记忆。
 MAX_JUDGE_ROUNDS = 4  # Jev 最多判断四次，作为循环保险丝。
 REVIEW_TIMEOUT = 120  # 整个子任务的等待上限；超时只退回 ask，不批准待审工具。
+ALLOW_PROBABILITY_THRESHOLD = 0.85
 
 REVIEW_RULES = (
     "你是工具权限审查的取证员，不是执行员。只用提供的取证工具，"
@@ -38,11 +42,11 @@ DECISIONS = {
 }
 
 
-async def judge_permission(request: dict, preferences: str, evidence: list) -> str:
-    """直接调用 Jev 的 Choice 协议，不把它伪装成能聊天或调用工具的模型。"""
+async def request_jev_response(request: dict, preferences: str, evidence: list) -> dict:
+    """发送生产环境使用的 Jev 请求，返回未经权限门槛处理的协议响应。"""
     key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not key:
-        return "ask"  # 没配置服务不能自动放行，也不需要先花千问的取证额度。
+        raise RuntimeError("缺少 OPENROUTER_API_KEY，不能请求 Jev。")
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
             "https://openrouter.ai/api/alpha/decisions",  # OpenRouter 为 Jev 提供的结构化决策接口。
@@ -56,15 +60,49 @@ async def judge_permission(request: dict, preferences: str, evidence: list) -> s
             },
         )
         response.raise_for_status()  # HTTP 错误由子 Agent 外层统一退回人工确认。
-        answer = response.json()["answers"]["permission"]
-        if answer.get("type") != "choice" or answer.get("choice") not in DECISIONS:
-            return "ask"  # 异常协议值不能当作允许执行。
-        if answer["choice"] == "allow":
-            probabilities = answer.get("probabilities", {})  # 每个选项的概率；不同于总体 confidence。
-            probability = probabilities.get("allow") if isinstance(probabilities, dict) else None
-            if type(probability) not in (int, float) or not 0.85 < probability <= 1:
-                return "ask"  # allow 把握不足或概率缺失/非法，直接请人确认，不反复取证。
-        return answer["choice"]  # uncertain 留在内部循环，不传给主 Agent 执行节点。
+        return response.json()
+
+
+def permission_from_jev_response(response_body: dict) -> str:
+    """把 Jev 的原始 Choice 响应映射为执行层权限，低把握 allow 降为 ask。"""
+    try:
+        answer = response_body["answers"]["permission"]
+    except (KeyError, TypeError):
+        return "ask"
+    if not isinstance(answer, dict) or answer.get("type") != "choice":
+        return "ask"
+    choice = answer.get("choice")
+    if choice not in DECISIONS:
+        return "ask"
+    if choice == "allow":
+        probabilities = answer.get("probabilities", {})
+        probability = probabilities.get("allow") if isinstance(probabilities, dict) else None
+        if type(probability) not in (int, float) or not ALLOW_PROBABILITY_THRESHOLD < probability <= 1:
+            return "ask"
+    return choice
+
+
+async def judge_permission(request: dict, preferences: str, evidence: list, *, round_number: int = 1) -> str:
+    """直接调用 Jev 的 Choice 协议，不把它伪装成能聊天或调用工具的模型。"""
+    observation = nullcontext()  # 关闭 tracing 或独立评测时不创建客户端、不另起孤立 trace。
+    if os.getenv("LANGFUSE_TRACING_ENABLED", "false").strip().lower() == "true" and get_current_span().get_span_context().is_valid:
+        observation = get_client().start_as_current_observation(
+            name="jev_permission", as_type="generation",
+            model=os.getenv("JEV_MODEL", "").strip() or "typesafe/jev-1.13",
+            input={"tool": request.get("tool"), "tool_call_id": request.get("tool_call_id"),
+                   "round": round_number, "evidence_items": len(evidence)},  # 不上报参数、用户诉求、偏好或证据正文。
+        )
+    with observation as span:  # 自动继承 review 的父 span，退出时记录耗时；并发任务各自独立。
+        response_body = await request_jev_response(request, preferences, evidence)
+        decision = permission_from_jev_response(response_body)
+        if span is not None:
+            answers = response_body.get("answers") if isinstance(response_body, dict) else None
+            answer = answers.get("permission") if isinstance(answers, dict) else None
+            answer = answer if isinstance(answer, dict) else {}
+            span.update(output={"choice": answer.get("choice"), "probabilities": answer.get("probabilities"),
+                                "confidence": answer.get("confidence"), "decision": decision,
+                                "allow_threshold": ALLOW_PROBABILITY_THRESHOLD})
+        return decision  # uncertain 仍留在内部循环；不改变权限或错误处理。
 
 
 def build_safety_reviewer(model, evidence_tools: list, preferences_path=SAFETY_USER_PATH):
@@ -84,7 +122,7 @@ def build_safety_reviewer(model, evidence_tools: list, preferences_path=SAFETY_U
         round_number = 0  # 记录 Jev 已经判断了几次。
         while True:  # 与内部千问取证一样显式使用 while 循环。
             round_number += 1  # 本轮即将调用 Jev，因此先计入次数。
-            decision = await judge_permission(request, preferences, evidence)  # 第一轮直接让 Jev 判断；只有 uncertain 才补取证。
+            decision = await judge_permission(request, preferences, evidence, round_number=round_number)  # 轮次仅用于 tracing，不发给 Jev。
             if decision in {"allow", "ask", "deny"}:
                 return decision
             if decision != "uncertain" or round_number >= MAX_JUDGE_ROUNDS:
