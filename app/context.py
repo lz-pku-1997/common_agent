@@ -16,6 +16,10 @@ from app.workspace_tools import resolve_workspace_path
 CONTEXT_TRIGGER_TOKENS = 200000
 MAX_SUMMARY_CHARS = 8000
 
+# 粗估时一个 token 折合多少字符。官方口径：1 个 token 约等于 1.5~1.8 个汉字，
+# 这里取下界 1.5，估出来的 token 数仍比实测值偏大约两成，方向始终是"宁估多不估少"。
+CHARS_PER_TOKEN = 1.5
+
 
 def limit_tool_result(content: str) -> tuple[str, dict | None]:
     """返回（模型看的预览，程序看的落盘记录）。短结果不落盘。"""
@@ -88,9 +92,9 @@ def model_messages(
 
 
 def estimated_tokens(messages: list[AnyMessage], tools: list[BaseTool]) -> int:
-    """连工具说明书一起粗估；按每字符 1 token 留足中文场景余量。"""
+    """连工具说明书一起粗估；按 CHARS_PER_TOKEN 折算成 token 数。"""
 
-    return count_tokens_approximately(messages, tools=tools, chars_per_token=1.0)
+    return count_tokens_approximately(messages, tools=tools, chars_per_token=CHARS_PER_TOKEN)
 
 
 def choose_summary_cut(
