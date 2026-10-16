@@ -29,6 +29,11 @@ KNOWLEDGE_DATABASE_PATH = DATA_DIR / "knowledge.sqlite"
 # 文件读取和工具入口共用这条字符预算，避免一页读完又被入口截断。
 MAX_TOOL_RESULT_CHARS = 20000
 
+# 落盘之后留在上下文里的预览长度，明显小于上面的预算。
+# 两个数是分开的，落盘才真的省：若预览也用 20000，刚过阈值时预览和原文一样长，
+# 加上落盘提示反而比不落盘更占地方。2000 与 Claude Code 的做法同量级。
+TOOL_RESULT_PREVIEW_CHARS = 2000
+
 
 def require_environment_variable(name: str) -> str:
     """读取一个必填环境变量；没有配置就给出能看懂的错误。"""

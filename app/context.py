@@ -6,7 +6,7 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemM
 from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.tools import BaseTool
 
-from app.config import MAX_TOOL_RESULT_CHARS
+from app.config import MAX_TOOL_RESULT_CHARS, TOOL_RESULT_PREVIEW_CHARS
 from app.tool_errors import NonRetryableError
 from app.workspace_tools import resolve_workspace_path
 
@@ -27,7 +27,7 @@ def limit_tool_result(content: str) -> tuple[str, dict | None]:
     if len(content) <= MAX_TOOL_RESULT_CHARS:
         return content, None
 
-    preview = content[:MAX_TOOL_RESULT_CHARS]
+    preview = content[:TOOL_RESULT_PREVIEW_CHARS]
     # 名字由程序生成，不使用模型返回的 tool_call_id；仍检查 workspace 路径边界。
     relative_path = f".tool_results/{uuid4().hex[:12]}.txt"
     try:
