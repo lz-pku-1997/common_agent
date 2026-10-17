@@ -75,10 +75,16 @@ def model_messages(
 
     messages.extend(history[summary_cursor:])
 
-    # 最近三条工具结果保留原文；较早且落过盘的结果换成文件引用。
+    # 本次提问的工具结果和最近三条都保留；只替换更早且落过盘的结果。
+    current_user = next(
+        (i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], HumanMessage)),
+        -1,
+    )  # 在实际输入中定位；摘要和历史切片会使下标与 history 不同。
     # artifact 是程序的落盘收据，不是模型正文，不能用正文长度推断保存是否成功。
     tool_indices = [i for i, message in enumerate(messages) if isinstance(message, ToolMessage)]
     for i in tool_indices[:-3]:
+        if latest_user is not None and i > current_user:
+            continue  # 本次提问尚未结束，不提前移除它的工具结果。
         message = messages[i]
         saved_path = (message.artifact or {}).get("saved_path")
         if saved_path:
